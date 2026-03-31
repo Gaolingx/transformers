@@ -714,6 +714,8 @@
         title: myt5
       - local: model_doc/nanochat
         title: NanoChat
+      - local: model_doc/nekomind_moe
+        title: NekoMindMoe
       - local: model_doc/nemotron
         title: Nemotron
       - local: model_doc/nemotron_h

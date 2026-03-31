@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PyTorch MiniMind model."""
+"""PyTorch NekoMind model."""
 from collections.abc import Callable
 
 import torch
@@ -44,17 +44,17 @@ from ..mixtral.modeling_mixtral import (
     load_balancing_loss_func,
 )
 from ..gemma.modeling_gemma import GemmaMLP
-from .configuration_minimind_moe import MiniMindMoeConfig
+from .configuration_minimind_moe import NekoMindMoeConfig
 
 
 logger = logging.get_logger(__name__)
 
 
-class MiniMindMoeAttention(LlamaAttention):
-    def __init__(self, config: MiniMindMoeConfig, layer_idx: int):
+class NekoMindMoeAttention(LlamaAttention):
+    def __init__(self, config: NekoMindMoeConfig, layer_idx: int):
         super().__init__(config, layer_idx)
-        self.q_norm = MiniMindMoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
-        self.k_norm = MiniMindMoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
+        self.q_norm = NekoMindMoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
+        self.k_norm = NekoMindMoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
         self.sliding_window = getattr(config, "sliding_window", None)
 
     def forward(
@@ -99,7 +99,7 @@ class MiniMindMoeAttention(LlamaAttention):
         return attn_output, attn_weights
 
 
-class MiniMindMoeMLP(GemmaMLP):
+class NekoMindMoeMLP(GemmaMLP):
     def __init__(self, config, intermediate_size=None):
         super().__init__()
         self.config = config
@@ -111,14 +111,14 @@ class MiniMindMoeMLP(GemmaMLP):
         self.act_fn = ACT2FN[config.hidden_act]
 
 
-class MiniMindMoeExperts(MixtralExperts):
+class NekoMindMoeExperts(MixtralExperts):
     def __init__(self, config):
         super().__init__(config)
         self.num_experts = config.num_experts
         self.intermediate_dim = config.moe_intermediate_size
 
 
-class MiniMindMoeTopKRouter(nn.Module):
+class NekoMindMoeTopKRouter(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.top_k = config.num_experts_per_tok
@@ -138,11 +138,11 @@ class MiniMindMoeTopKRouter(nn.Module):
         return router_logits, router_scores, router_indices
 
 
-class MiniMindMoeSparseMoeBlock(nn.Module):
-    def __init__(self, config: MiniMindMoeConfig):
+class NekoMindMoeSparseMoeBlock(nn.Module):
+    def __init__(self, config: NekoMindMoeConfig):
         super().__init__()
-        self.experts = MiniMindMoeExperts(config)
-        self.gate = MiniMindMoeTopKRouter(config)
+        self.experts = NekoMindMoeExperts(config)
+        self.gate = NekoMindMoeTopKRouter(config)
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -152,34 +152,34 @@ class MiniMindMoeSparseMoeBlock(nn.Module):
         return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
 
 
-class MiniMindMoeRMSNorm(LlamaRMSNorm):
+class NekoMindMoeRMSNorm(LlamaRMSNorm):
     pass
 
 
-class MiniMindMoeDecoderLayer(LlamaDecoderLayer):
-    def __init__(self, config: MiniMindMoeConfig, layer_idx: int):
+class NekoMindMoeDecoderLayer(LlamaDecoderLayer):
+    def __init__(self, config: NekoMindMoeConfig, layer_idx: int):
         nn.Module.__init__(self)
-        self.self_attn = MiniMindMoeAttention(config, layer_idx)
+        self.self_attn = NekoMindMoeAttention(config, layer_idx)
         if (layer_idx not in config.mlp_only_layers) and (
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
-            self.mlp = MiniMindMoeSparseMoeBlock(config)
+            self.mlp = NekoMindMoeSparseMoeBlock(config)
         else:
-            self.mlp = MiniMindMoeMLP(config, intermediate_size=config.intermediate_size)
-        self.input_layernorm = MiniMindMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = MiniMindMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.mlp = NekoMindMoeMLP(config, intermediate_size=config.intermediate_size)
+        self.input_layernorm = NekoMindMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = NekoMindMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hidden_size = config.hidden_size
 
 
-class MiniMindMoePreTrainedModel(MixtralPreTrainedModel):
+class NekoMindMoePreTrainedModel(MixtralPreTrainedModel):
     _can_record_outputs = {
-        "router_logits": OutputRecorder(MiniMindMoeTopKRouter, index=0),
-        "hidden_states": MiniMindMoeDecoderLayer,
-        "attentions": MiniMindMoeAttention,
+        "router_logits": OutputRecorder(NekoMindMoeTopKRouter, index=0),
+        "hidden_states": NekoMindMoeDecoderLayer,
+        "attentions": NekoMindMoeAttention,
     }
 
 
-class MiniMindMoeModel(MixtralModel):
+class NekoMindMoeModel(MixtralModel):
     pass
 
 
@@ -228,10 +228,10 @@ def router_z_loss_func(
     return z_loss
 
 
-class MiniMindMoeForCausalLM(MixtralForCausalLM):
+class NekoMindMoeForCausalLM(MixtralForCausalLM):
     def __init__(self, config):
         super().__init__(config)
-        self.model = MiniMindMoeModel(config)
+        self.model = NekoMindMoeModel(config)
         self.num_experts = config.num_experts
 
     def forward(
@@ -323,23 +323,23 @@ class MiniMindMoeForCausalLM(MixtralForCausalLM):
         )
 
 
-class MiniMindMoeForSequenceClassification(LlamaForSequenceClassification):
+class NekoMindMoeForSequenceClassification(LlamaForSequenceClassification):
     pass
 
 
-class MiniMindMoeForTokenClassification(LlamaForTokenClassification):
+class NekoMindMoeForTokenClassification(LlamaForTokenClassification):
     pass
 
 
-class MiniMindMoeForQuestionAnswering(LlamaForQuestionAnswering):
+class NekoMindMoeForQuestionAnswering(LlamaForQuestionAnswering):
     pass
 
 
 __all__ = [
-    "MiniMindMoeForCausalLM",
-    "MiniMindMoeForQuestionAnswering",
-    "MiniMindMoeModel",
-    "MiniMindMoePreTrainedModel",  # noqa: F822
-    "MiniMindMoeForSequenceClassification",
-    "MiniMindMoeForTokenClassification",
+    "NekoMindMoeForCausalLM",
+    "NekoMindMoeForQuestionAnswering",
+    "NekoMindMoeModel",
+    "NekoMindMoePreTrainedModel",  # noqa: F822
+    "NekoMindMoeForSequenceClassification",
+    "NekoMindMoeForTokenClassification",
 ]
