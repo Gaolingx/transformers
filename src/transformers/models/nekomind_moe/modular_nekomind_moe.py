@@ -44,7 +44,7 @@ from ..mixtral.modeling_mixtral import (
     load_balancing_loss_func,
 )
 from ..gemma.modeling_gemma import GemmaMLP
-from .configuration_minimind_moe import NekoMindMoeConfig
+from .configuration_nekomind_moe import NekoMindMoeConfig
 
 
 logger = logging.get_logger(__name__)

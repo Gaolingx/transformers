@@ -13,13 +13,13 @@
 # limitations under the License.
 from typing import TYPE_CHECKING
 
-from transformers.utils import _LazyModule
-from transformers.utils.import_utils import define_import_structure
+from ...utils import _LazyModule
+from ...utils.import_utils import define_import_structure
 
 
 if TYPE_CHECKING:
-    from .configuration_gpt_oss import *
-    from .modeling_gpt_oss import *
+    from .configuration_nekomind_moe import *
+    from .modeling_nekomind_moe import *
 else:
     import sys
 

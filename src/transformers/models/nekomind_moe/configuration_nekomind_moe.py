@@ -103,7 +103,7 @@ class NekoMindMoeConfig(PreTrainedConfig):
     >>> configuration = model.config
     ```"""
 
-    model_type = "minimind_moe"
+    model_type = "nekomind_moe"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     attribute_map = {

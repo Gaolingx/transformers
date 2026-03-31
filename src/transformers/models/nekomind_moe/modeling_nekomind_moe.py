@@ -49,7 +49,7 @@ from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
 from ...utils.generic import maybe_autocast, merge_with_config_defaults
 from ...utils.output_capturing import OutputRecorder, capture_outputs
-from .configuration_minimind_moe import NekoMindMoeConfig
+from .configuration_nekomind_moe import NekoMindMoeConfig
 
 
 def rotate_half(x):
