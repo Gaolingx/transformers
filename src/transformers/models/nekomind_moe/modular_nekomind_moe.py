@@ -233,6 +233,7 @@ class NekoMindMoeForCausalLM(MixtralForCausalLM):
         super().__init__(config)
         self.model = NekoMindMoeModel(config)
         self.num_experts = config.num_experts
+        self.router_z_loss_coef = config.router_z_loss_coef
 
     def forward(
         self,
@@ -315,6 +316,7 @@ class NekoMindMoeForCausalLM(MixtralForCausalLM):
         return MoECausalLMOutputWithPast(
             loss=loss,
             aux_loss=aux_loss,
+            z_loss=z_loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
