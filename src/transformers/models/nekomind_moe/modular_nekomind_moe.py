@@ -21,7 +21,7 @@ from torch import nn
 from ...activations import ACT2FN
 from ...cache_utils import Cache
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
-from ...modeling_outputs import MoECausalLMOutputWithPast, MoeModelOutputWithPast
+from ...modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS
 from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, logging
@@ -191,57 +191,11 @@ class NekoMindMoeModel(MixtralModel):
     pass
 
 
-def router_z_loss_func(
-    router_logits: tuple[torch.Tensor] | None,
-    attention_mask: torch.Tensor | None = None,
-) -> int:
-    r"""
-    Compute the router z-loss implemented in PyTorch.
-
-    The router z-loss was introduced in [Designing Effective Sparse Expert Models](https://huggingface.co/papers/2202.08906).
-    It encourages router logits to remain small in an effort to improve stability.
-
-    Args:
-        router_logits (`float`):
-            Input logits of shape [batch_size, sequence_length, num_experts]
-
-    Returns:
-        Scalar router z-loss.
-    """
-    if router_logits is None or not isinstance(router_logits, tuple):
-        return 0
-
-    if isinstance(router_logits, tuple):
-        compute_device = router_logits[0].device
-        concatenated_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in router_logits], dim=0)
-
-    log_z = torch.logsumexp(concatenated_logits, dim=-1)
-    z_loss = log_z**2
-
-    if attention_mask is None:
-        z_loss = z_loss.mean()
-    else:
-        batch_size, seq_len = attention_mask.shape
-        num_moe_layers = concatenated_logits.shape[0] // (batch_size * seq_len)
-
-        mask = (
-            attention_mask[None, :, :]
-            .expand(num_moe_layers, batch_size, seq_len)
-            .reshape(-1)
-            .to(compute_device)
-        )
-
-        z_loss = (z_loss * mask).sum() / mask.sum()
-
-    return z_loss
-
-
 class NekoMindMoeForCausalLM(MixtralForCausalLM):
     def __init__(self, config):
         super().__init__(config)
         self.model = NekoMindMoeModel(config)
         self.num_experts = config.num_experts
-        self.router_z_loss_coef = config.router_z_loss_coef
 
     def forward(
         self,
@@ -255,7 +209,7 @@ class NekoMindMoeForCausalLM(MixtralForCausalLM):
         output_router_logits: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> MoECausalLMOutputWithPast:
+    ) -> MoeCausalLMOutputWithPast:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
@@ -305,7 +259,6 @@ class NekoMindMoeForCausalLM(MixtralForCausalLM):
             loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)
 
         aux_loss = None
-        z_loss = None
         if output_router_logits:
             aux_loss = load_balancing_loss_func(
                 outputs.router_logits,
@@ -313,18 +266,12 @@ class NekoMindMoeForCausalLM(MixtralForCausalLM):
                 self.num_experts_per_tok,
                 attention_mask,
             )
-            z_loss = router_z_loss_func(
-                outputs.router_logits,
-                attention_mask,
-            )
             if labels is not None:
                 loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
-                loss += self.router_z_loss_coef * z_loss.to(loss.device)
 
-        return MoECausalLMOutputWithPast(
+        return MoeCausalLMOutputWithPast(
             loss=loss,
             aux_loss=aux_loss,
-            z_loss=z_loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
