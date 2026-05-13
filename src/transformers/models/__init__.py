@@ -248,6 +248,7 @@ if TYPE_CHECKING:
     from .mimi import *
     from .minimax import *
     from .minimax_m2 import *
+    from .nekomind_moe import *
     from .ministral import *
     from .ministral3 import *
     from .mistral import *
