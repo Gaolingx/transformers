@@ -107,9 +107,9 @@ class NekoMindMoeIntegrationTest(unittest.TestCase):
         ]
 
         prompts = ["[gMASK]<sop>hello", "[gMASK]<sop>tell me"]
-        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-30B-A3B")
+        tokenizer = AutoTokenizer.from_pretrained("nekocyrene/NekoMind1.5-Base")
         model = NekoMindMoeForCausalLM.from_pretrained(
-            "Qwen/Qwen3-30B-A3B", device_map=torch_device, torch_dtype=torch.bfloat16
+            "nekocyrene/NekoMind1.5-Base", device_map=torch_device, torch_dtype=torch.bfloat16
         )
         inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(model.device)
 
