@@ -32,20 +32,18 @@ except ImportError:
 
 from ...activations import ACT2FN
 from ...cache_utils import Cache
+from ...generation import GenerationMixin
 from ...configuration_utils import PreTrainedConfig
 from ...masking_utils import create_causal_mask
 from ...modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
-from ...modeling_utils import ALL_ATTENTION_FUNCTIONS
+from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
-from ...utils import TransformersKwargs, auto_docstring, logging
+from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
 from ...utils.generic import merge_with_config_defaults
 from ...utils.output_capturing import OutputRecorder, capture_outputs
 from ..llama.modeling_llama import LlamaRMSNorm
 from ..mixtral.modeling_mixtral import (
     MixtralExperts,
-    MixtralForCausalLM,
-    MixtralModel,
-    MixtralPreTrainedModel,
     load_balancing_loss_func,
 )
 from ..gemma.modeling_gemma import GemmaMLP
@@ -820,28 +818,58 @@ class NekoMindMoeDecoderLayer(nn.Module):
         return hidden_states
 
 
-class NekoMindMoePreTrainedModel(MixtralPreTrainedModel):
-    _is_stateful = True
-    _can_compile_fullgraph = False
-
+@auto_docstring
+class NekoMindMoePreTrainedModel(PreTrainedModel):
+    config_class = NekoMindMoeConfig
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["NekoMindMoeDecoderLayer"]
+    _skip_keys_device_placement = ["past_key_values"]
+    _supports_flash_attn_2 = True
     _can_record_outputs = {
-        "router_logits": OutputRecorder(NekoMindMoeTopKRouter, index=0),
+        "router_logits": OutputRecorder(NekoMindMoeMLP, index=1),
         "hidden_states": NekoMindMoeDecoderLayer,
         "attentions": NekoMindMoeMLAAttention,
     }
+    _is_stateful = True
+
+    def _init_weights(self, module):
+        std = self.config.initializer_range
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
 
 
-class NekoMindMoeModel(MixtralModel):
+@auto_docstring
+class NekoMindMoeModel(NekoMindMoePreTrainedModel):
     def __init__(self, config: NekoMindMoeConfig):
-        NekoMindMoePreTrainedModel.__init__(self, config)
+        super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
             [NekoMindMoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = NekoMindMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        if getattr(config, "_attn_implementation", None) is not None:
+            if config._attn_implementation != "flash_attention_2":
+                logger.warning_once(
+                    f"Ignoring the provided attention implementation {config._attn_implementation}")
+                logger.warning_once("Using flash_attention_2 backend instead.")
+                config._attn_implementation = "flash_attention_2"
+        else:
+            config._attn_implementation = "flash_attention_2"
+
+        self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
         self.gradient_checkpointing = False
+        # Initialize weights and apply final processing
         self.post_init()
 
     def _update_linear_attn_mask(self, attention_mask, cache_position):
@@ -926,16 +954,25 @@ class NekoMindMoeModel(MixtralModel):
         )
 
 
-class NekoMindMoeForCausalLM(MixtralForCausalLM):
-    @classmethod
-    def _supports_default_dynamic_cache(cls) -> bool:
-        return False
+@auto_docstring
+class NekoMindMoeForCausalLM(NekoMindMoePreTrainedModel, GenerationMixin):
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    _tp_plan = {"lm_head": "colwise_gather_output"}
+    _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
     def __init__(self, config):
         super().__init__(config)
         self.model = NekoMindMoeModel(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(
+            config.hidden_size, config.vocab_size, bias=False)
         self.num_experts = config.num_experts
 
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    @can_return_tuple
+    @auto_docstring
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
