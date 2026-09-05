@@ -24,10 +24,11 @@ from torch import nn
 try:
     from fla.modules import FusedRMSNormGated, ShortConvolution
     from fla.ops.kda import chunk_kda, fused_recurrent_kda
+    # from fla.ops.kda.gate import fused_kda_gate  # deprecated, gate is now computed inside chunk_kda/fused_recurrent_kda
     from fla.ops.utils.index import prepare_cu_seqlens_from_mask, prepare_lens_from_mask
     from fla.utils import tensor_cache
-except ImportError as error:
-    raise ImportError("Please run `pip install -U fla-core`") from error
+except ImportError:
+    raise ImportError("Plese run `pip install -U fla-core`")
 
 from ...activations import ACT2FN
 from ...cache_utils import Cache
@@ -39,13 +40,7 @@ from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, logging
 from ...utils.generic import merge_with_config_defaults
 from ...utils.output_capturing import OutputRecorder, capture_outputs
-from ..llama.modeling_llama import (
-    LlamaDecoderLayer,
-    LlamaForQuestionAnswering,
-    LlamaForSequenceClassification,
-    LlamaForTokenClassification,
-    LlamaRMSNorm,
-)
+from ..llama.modeling_llama import LlamaRMSNorm
 from ..mixtral.modeling_mixtral import (
     MixtralExperts,
     MixtralForCausalLM,
@@ -236,7 +231,7 @@ def pad_input(
 
 class NekoMindMoeDynamicCache:
     """
-    Dynamic cache for NekoMind MLA and KDA layers (ported from K3).
+    Dynamic cache for NekoMindMoe model.
     Inspired by Qwen3-Next
     """
     is_compileable = False
@@ -254,9 +249,6 @@ class NekoMindMoeDynamicCache:
                     self.layer_types.append("full_attention")
         else:
             self.layer_types = ["full_attention"] * config.num_hidden_layers
-
-        self.is_sliding = [False] * config.num_hidden_layers
-        self._seen_tokens = 0
 
         self.transformer_layers = [
             i for i in range(config.num_hidden_layers) if self.layer_types[i] == "full_attention"
@@ -317,29 +309,23 @@ class NekoMindMoeDynamicCache:
 
     def get_seq_length(self, layer_idx: int | None = 0) -> int:
         """Returns the sequence length of the cached states. A layer index can be optionally passed."""
-        if not self.transformer_layers:
-            return self._seen_tokens
         # take any layer that contains cache and not empty tensor
         layer_idx = self.transformer_layers[0] if layer_idx not in self.transformer_layers else layer_idx
         if len(self.key_cache) <= layer_idx or self.key_cache[layer_idx] is None:
             return 0
         return self.key_cache[layer_idx].shape[-2]
 
-    def get_mask_sizes(self, query_length: int | torch.Tensor, layer_idx: int) -> tuple[int, int]:
+    def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int) -> tuple[int, int]:
         """
         Return a tuple (kv_length, kv_offset) corresponding to the length and offset that will be returned for
         the given layer at `layer_idx`.
         The masks are then prepared according to the given lengths (kv_length, kv_offset) and patterns for each layer.
         """
         kv_offset = 0
-        if isinstance(query_length, torch.Tensor):
-            query_length = query_length.shape[0]
+        query_length = cache_position.shape[0]
         past_seen_tokens = self.get_seq_length(layer_idx)
         kv_length = query_length + past_seen_tokens
         return kv_length, kv_offset
-
-    def get_max_cache_shape(self, layer_idx: int = 0) -> int:
-        return -1
 
     @property
     def has_previous_state(self):
@@ -776,9 +762,9 @@ class NekoMindMoeRMSNorm(LlamaRMSNorm):
     pass
 
 
-class NekoMindMoeDecoderLayer(LlamaDecoderLayer):
+class NekoMindMoeDecoderLayer(nn.Module):
     def __init__(self, config: NekoMindMoeConfig, layer_idx: int):
-        nn.Module.__init__(self)
+        super().__init__()
         self.is_linear_attn = config.is_kda_layer(layer_idx)
         if self.is_linear_attn:
             self.self_attn = NekoMindMoeDeltaAttention(config, layer_idx)
@@ -807,7 +793,7 @@ class NekoMindMoeDecoderLayer(LlamaDecoderLayer):
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        # K3's KDA returns a tensor and uses its recurrent/conv cache directly.
+        # Self Attention
         if self.is_linear_attn:
             hidden_states = self.self_attn(
                 hidden_states=hidden_states,
@@ -892,35 +878,41 @@ class NekoMindMoeModel(MixtralModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if past_key_values is not None and not isinstance(past_key_values, NekoMindMoeDynamicCache):
-            raise TypeError("past_key_values must be a NekoMindMoeDynamicCache")
-        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-        cache_position = torch.arange(
-            past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-        )
+        if use_cache and past_key_values is None:
+            past_key_values = NekoMindMoeDynamicCache(config=self.config)
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length(
+            ) if past_key_values is not None else 0
+            cache_position: torch.Tensor = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device,
+            )
+
         if position_ids is None:
-            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
-            position_ids = position_ids.unsqueeze(0)
+            position_ids = cache_position.unsqueeze(0)
 
         causal_mask = create_causal_mask(
             config=self.config,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
+            cache_position=cache_position,
             past_key_values=past_key_values,
             position_ids=position_ids,
         )
-
-        linear_attn_mask = self._update_linear_attn_mask(attention_mask, cache_position)
+        linear_attn_mask = self._update_linear_attn_mask(
+            attention_mask, cache_position)
 
         hidden_states = inputs_embeds
+        if past_key_values is not None:
+            assert isinstance(past_key_values, NekoMindMoeDynamicCache)
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            layer_mask = linear_attn_mask if decoder_layer.is_linear_attn else causal_mask
             hidden_states = decoder_layer(
                 hidden_states,
-                attention_mask=linear_attn_mask if decoder_layer.is_linear_attn else causal_mask,
-                position_ids=position_ids,
+                attention_mask=layer_mask,
                 past_key_values=past_key_values,
-                use_cache=use_cache,
+                cache_position=cache_position,
                 **kwargs,
             )
 
@@ -1027,24 +1019,9 @@ class NekoMindMoeForCausalLM(MixtralForCausalLM):
         )
 
 
-class NekoMindMoeForSequenceClassification(LlamaForSequenceClassification):
-    pass
-
-
-class NekoMindMoeForTokenClassification(LlamaForTokenClassification):
-    pass
-
-
-class NekoMindMoeForQuestionAnswering(LlamaForQuestionAnswering):
-    pass
-
-
 __all__ = [
     "NekoMindMoeConfig",
     "NekoMindMoeForCausalLM",
-    "NekoMindMoeForQuestionAnswering",
     "NekoMindMoeModel",
     "NekoMindMoePreTrainedModel",
-    "NekoMindMoeForSequenceClassification",
-    "NekoMindMoeForTokenClassification",
 ]
