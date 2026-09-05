@@ -12,36 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """PyTorch NekoMind model."""
+import math
 from collections.abc import Callable
-from typing import Any
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange
 from huggingface_hub.dataclasses import strict
 from torch import nn
 
-try:
-    from fla.modules import FusedRMSNormGated, ShortConvolution
-    from fla.ops.kda import chunk_kda, fused_recurrent_kda
-    # from fla.ops.kda.gate import fused_kda_gate  # deprecated, gate is now computed inside chunk_kda/fused_recurrent_kda
-    from fla.ops.utils.index import prepare_cu_seqlens_from_mask, prepare_lens_from_mask
-    from fla.utils import tensor_cache
-except ImportError:
-    raise ImportError("Plese run `pip install -U fla-core`")
-
+from ... import initialization as init
 from ...activations import ACT2FN
-from ...cache_utils import Cache
+from ...cache_utils import Cache, DynamicCache
 from ...generation import GenerationMixin
+from ...modeling_flash_attention_utils import FlashAttentionKwargs
+from ...modeling_layers import GradientCheckpointingLayer
 from ...configuration_utils import PreTrainedConfig
-from ...masking_utils import create_causal_mask
+from ...masking_utils import create_causal_mask, create_recurrent_attention_mask
 from ...modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
 from ...utils.generic import merge_with_config_defaults
 from ...utils.output_capturing import OutputRecorder, capture_outputs
-from ..llama.modeling_llama import LlamaRMSNorm
+from ..deepseek_v3.modeling_deepseek_v3 import DeepseekV3Attention
+from ..glm5_next.modeling_glm5_next import (
+    Glm5NextTextForgetGate,
+    Glm5NextTextLinearAttention,
+    Glm5NextTextRMSNormGated,
+)
+from ..llama.modeling_llama import LlamaRMSNorm, eager_attention_forward
 from ..mixtral.modeling_mixtral import (
     MixtralExperts,
     load_balancing_loss_func,
@@ -201,478 +200,48 @@ class NekoMindMoeConfig(PreTrainedConfig):
         )
 
 
-def index_first_axis(x, indices):
-    return x[indices]
+class NekoMindMoeLinearAttention(DeepseekV3Attention):
+    """Multi-headed Latent Attention (MLA) from Deepseek V2 with NoPE, but the part of the keys where RoPE is applied is
+    still shared."""
 
-
-@tensor_cache
-def get_unpad_data(
-    attention_mask: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, int]:
-    lens = prepare_lens_from_mask(attention_mask)
-    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
-    max_seqlen_in_batch = lens.max().item()
-    cu_seqlens = prepare_cu_seqlens_from_mask(attention_mask)
-    return indices, cu_seqlens, max_seqlen_in_batch
-
-
-def pad_input(
-    hidden_states: torch.Tensor,
-    indices: torch.LongTensor,
-    batch_size: int,
-    seq_len: int,
-) -> torch.Tensor:
-    out = hidden_states.new_zeros((batch_size * seq_len, *hidden_states.shape[1:]))
-    out[indices] = hidden_states
-    return out.view(batch_size, seq_len, *hidden_states.shape[1:])
-
-
-class NekoMindMoeDynamicCache:
-    """
-    Dynamic cache for NekoMindMoe model.
-    Inspired by Qwen3-Next
-    """
-    is_compileable = False
-
-    def __init__(self, config: NekoMindMoeConfig):
-        super().__init__()
-        self.config = config
-
-        if config.linear_attn_config is not None:
-            self.layer_types = []
-            for i in range(config.num_hidden_layers):
-                if config.is_kda_layer(i):
-                    self.layer_types.append("linear_attention")
-                else:
-                    self.layer_types.append("full_attention")
-        else:
-            self.layer_types = ["full_attention"] * config.num_hidden_layers
-
-        self.transformer_layers = [
-            i for i in range(config.num_hidden_layers) if self.layer_types[i] == "full_attention"
-        ]
-
-        linear_layers = [i for i in range(
-            config.num_hidden_layers) if self.layer_types[i] == "linear_attention"]
-        self.last_linear_layer = linear_layers[-1] if linear_layers else -1
-
-        self.conv_states = [None for _ in range(config.num_hidden_layers)]
-        self.recurrent_states = [None for _ in range(config.num_hidden_layers)]
-        self.key_cache = [None for _ in range(config.num_hidden_layers)]
-        self.value_cache = [None for _ in range(config.num_hidden_layers)]
-
-    def __len__(self):
-        return len(self.layer_types)
-
-    def update(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        layer_idx: int,
-        cache_kwargs: dict[str, Any] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.key_cache[layer_idx] is None:
-            self.key_cache[layer_idx] = key_states
-            self.value_cache[layer_idx] = value_states
-        else:
-            self.key_cache[layer_idx] = torch.cat(
-                [self.key_cache[layer_idx], key_states], dim=2)
-            self.value_cache[layer_idx] = torch.cat(
-                [self.value_cache[layer_idx], value_states], dim=2)
-
-        return self.key_cache[layer_idx], self.value_cache[layer_idx]
-
-    def reorder_cache(self, beam_idx: torch.LongTensor):
-        """Reorders the cache for beam search, given the selected beam indices."""
-        for layer_idx in range(len(self.key_cache)):
-            if self.key_cache[layer_idx] is not None:
-                device = self.key_cache[layer_idx].device
-                beam_idx = beam_idx.to(device)
-                self.key_cache[layer_idx] = self.key_cache[layer_idx].index_select(
-                    0, beam_idx)
-                self.value_cache[layer_idx] = self.value_cache[layer_idx].index_select(
-                    0, beam_idx)
-
-            if self.conv_states[layer_idx] is not None:
-                device = self.conv_states[layer_idx][0].device
-                beam_idx = beam_idx.to(device)
-                q_conv, k_conv, v_conv = self.conv_states[layer_idx]
-                self.conv_states[layer_idx] = (
-                    q_conv.index_select(0, beam_idx),
-                    k_conv.index_select(0, beam_idx),
-                    v_conv.index_select(0, beam_idx),
-                )
-                self.recurrent_states[layer_idx] = self.recurrent_states[layer_idx].index_select(
-                    0, beam_idx)
-
-    def get_seq_length(self, layer_idx: int | None = 0) -> int:
-        """Returns the sequence length of the cached states. A layer index can be optionally passed."""
-        # take any layer that contains cache and not empty tensor
-        layer_idx = self.transformer_layers[0] if layer_idx not in self.transformer_layers else layer_idx
-        if len(self.key_cache) <= layer_idx or self.key_cache[layer_idx] is None:
-            return 0
-        return self.key_cache[layer_idx].shape[-2]
-
-    def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int) -> tuple[int, int]:
-        """
-        Return a tuple (kv_length, kv_offset) corresponding to the length and offset that will be returned for
-        the given layer at `layer_idx`.
-        The masks are then prepared according to the given lengths (kv_length, kv_offset) and patterns for each layer.
-        """
-        kv_offset = 0
-        query_length = cache_position.shape[0]
-        past_seen_tokens = self.get_seq_length(layer_idx)
-        kv_length = query_length + past_seen_tokens
-        return kv_length, kv_offset
-
-    @property
-    def has_previous_state(self):
-        """We have a previous state if the last linear (conv) layer was already updated."""
-        if self.last_linear_layer == -1:
-            return False
-        return self.conv_states[self.last_linear_layer] is not None
-
-
-class NekoMindMoeDeltaAttention(nn.Module):
     def __init__(self, config: NekoMindMoeConfig, layer_idx: int):
-        super().__init__()
-        self.config = config
-        self.mode = "chunk"
-
-        self.hidden_size = config.hidden_size
-        self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
-        self.head_dim = config.linear_attn_config["head_dim"]
-        self.num_heads = config.linear_attn_config["num_heads"]
-        self.head_k_dim = self.head_dim
-        self.num_k_heads = self.num_heads
-
-        self.layer_idx = layer_idx
-
-        assert self.mode in [
-            'chunk', 'fused_recurrent'], f"Not supported mode `{self.mode}`."
-
-        projection_k_size = self.head_k_dim * self.num_k_heads
-        projection_size = self.head_dim * self.num_heads
-
-        self.q_proj = nn.Linear(
-            self.hidden_size, projection_k_size, bias=False)
-        self.k_proj = nn.Linear(
-            self.hidden_size, projection_k_size, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
-
-        self.q_conv1d = ShortConvolution(
-            hidden_size=projection_k_size,
-            kernel_size=self.conv_size,
-            activation='silu',
-        )
-        self.k_conv1d = ShortConvolution(
-            hidden_size=projection_k_size,
-            kernel_size=self.conv_size,
-            activation='silu',
-        )
-        self.v_conv1d = ShortConvolution(
-            hidden_size=projection_size,
-            kernel_size=self.conv_size,
-            activation='silu',
-        )
-
-        self.A_log = torch.nn.Parameter(torch.log(torch.empty(
-            self.num_heads, dtype=torch.float32).uniform_(1, 16)))
-
-        self.f_a_proj = nn.Linear(self.hidden_size, self.head_dim, bias=False)
-        self.f_b_proj = nn.Linear(self.head_dim, projection_size, bias=False)
-
-        self.dt_bias = nn.Parameter(
-            torch.empty(projection_size, dtype=torch.float32))
-
-        self.b_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
-
-        self.use_full_rank_gate = config.linear_attn_config.get("use_full_rank_gate", False)
-        self.gate_lower_bound = config.linear_attn_config.get("gate_lower_bound", None)
-        if self.use_full_rank_gate:
-            self.g_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
-        else:
-            self.g_a_proj = nn.Linear(self.hidden_size, self.head_dim, bias=False)
-            self.g_b_proj = nn.Linear(self.head_dim, projection_size, bias=False)
-
-        self.o_norm = FusedRMSNormGated(
-            self.head_dim, eps=config.rms_norm_eps, activation='sigmoid')
-        self.o_proj = nn.Linear(projection_size, self.hidden_size, bias=False)
+        super().__init__(config, layer_idx)
+        self.scaling = self.qk_head_dim ** (-0.5)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        cache_params: NekoMindMoeDynamicCache | None = None,
-        **kwargs: Unpack[dict],
-    ) -> torch.Tensor:
-        if attention_mask is not None:
-            if attention_mask.dim() != 2:
-                attention_mask = kwargs.get("padding_mask")
-
-            if attention_mask is not None and attention_mask.dim() != 2:
-                raise ValueError(
-                    "attention_mask must be a 0-1 matrix of shape [batch_size, seq_len] "
-                    "(0 = padding). 3D masks are not supported here.",
-                )
-        use_cache = cache_params is not None
-        batch_size, q_len, _ = hidden_states.shape
-        mode = 'fused_recurrent' if use_cache and q_len == 1 else self.mode
-        if self.training:
-            assert mode == 'chunk', "Only chunk mode is supported in training."
-
-        cu_seqlens = kwargs.get('cu_seqlens')
-        indices = None
-        if attention_mask is not None:
-            indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
-            hidden_states = index_first_axis(
-                rearrange(hidden_states, "b s ... -> (b s) ..."), indices).unsqueeze(0)
-
-        conv_state_q, conv_state_k, conv_state_v = None, None, None
-        recurrent_state = None
-        if cache_params is not None:
-            if cache_params.conv_states[self.layer_idx] is not None:
-                conv_state_q, conv_state_k, conv_state_v = cache_params.conv_states[
-                    self.layer_idx]
-            recurrent_state = cache_params.recurrent_states[self.layer_idx]
-
-        q_proj_states = self.q_proj(hidden_states)
-        k_proj_states = self.k_proj(hidden_states)
-        v_proj_states = self.v_proj(hidden_states)
-        q, conv_state_q = self.q_conv1d(
-            x=q_proj_states,
-            cache=conv_state_q,
-            output_final_state=use_cache,
-            cu_seqlens=cu_seqlens,
-        )
-        k, conv_state_k = self.k_conv1d(
-            x=k_proj_states,
-            cache=conv_state_k,
-            output_final_state=use_cache,
-            cu_seqlens=cu_seqlens,
-        )
-        v, conv_state_v = self.v_conv1d(
-            x=v_proj_states,
-            cache=conv_state_v,
-            output_final_state=use_cache,
-            cu_seqlens=cu_seqlens,
-        )
-        g = self.f_b_proj(self.f_a_proj(hidden_states))
-        g = rearrange(g, '... (h d) -> ... h d', d=self.head_dim)
-        beta = self.b_proj(hidden_states).float()
-
-        q, k = map(lambda x: rearrange(
-            x, '... (h d) -> ... h d', d=self.head_k_dim), (q, k))
-        v = rearrange(v, '... (h d) -> ... h d', d=self.head_dim)
-
-        if mode == 'chunk':
-            o, recurrent_state = chunk_kda(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                A_log=self.A_log,
-                dt_bias=self.dt_bias,
-                initial_state=recurrent_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-                use_gate_in_kernel=True,
-                use_beta_sigmoid_in_kernel=True,
-                safe_gate=self.gate_lower_bound is not None,
-                lower_bound=self.gate_lower_bound,
-                transpose_state_layout=True,
-                cu_seqlens=cu_seqlens,
-            )
-        else:
-            o, recurrent_state = fused_recurrent_kda(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                A_log=self.A_log,
-                dt_bias=self.dt_bias,
-                initial_state=recurrent_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-                use_gate_in_kernel=True,
-                use_beta_sigmoid_in_kernel=True,
-                lower_bound=self.gate_lower_bound,
-                transpose_state_layout=True,
-                cu_seqlens=cu_seqlens,
-            )
-        if cache_params is not None:
-            cache_params.recurrent_states[self.layer_idx] = recurrent_state
-            cache_params.conv_states[self.layer_idx] = (
-                conv_state_q, conv_state_k, conv_state_v)
-
-        if self.use_full_rank_gate:
-            g = self.g_proj(hidden_states)
-        else:
-            g = self.g_b_proj(self.g_a_proj(hidden_states))
-        g = rearrange(g, '... (h d) -> ... h d', d=self.head_dim)
-        o = self.o_norm(o, g)
-
-        o = rearrange(o, 'b t h d -> b t (h d)')
-        o = self.o_proj(o)
-        if attention_mask is not None:
-            o = pad_input(o.squeeze(0), indices, batch_size, q_len)
-
-        return o
-
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """Expand the key/value heads from `num_key_value_heads` to `num_attention_heads`."""
-    if n_rep == 1:
-        return hidden_states
-    return torch.repeat_interleave(hidden_states, dim=1, repeats=n_rep)
-
-
-def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs: Unpack[TransformersKwargs],
-):
-    key = repeat_kv(key, module.num_key_value_groups)
-    value = repeat_kv(value, module.num_key_value_groups)
-
-    scores = torch.einsum("bhqd,bhkd->bhqk", query, key) * scaling
-    if attention_mask is not None:
-        scores = scores + attention_mask[:, :, :, : key.shape[-2]]
-
-    probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
-    probs = F.dropout(probs, p=dropout, training=module.training)
-    out = torch.einsum("bhqk,bhkd->bhqd", probs, value).transpose(1, 2).contiguous()
-
-    return out, probs
-
-
-class NekoMindMoeMLAAttention(nn.Module):
-    """
-    Multi-Latent Attention adapted from deepseek-v3
-    """
-
-    def __init__(self, config: NekoMindMoeConfig, layer_idx: int):
-        nn.Module.__init__(self)
-        self.config = config
-        self.layer_idx = layer_idx
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-
-        self.attention_dropout = getattr(config, "attention_dropout", 0.0)
-
-        try:
-            self.q_lora_rank = config.q_lora_rank
-            self.qk_rope_head_dim = config.qk_rope_head_dim
-            self.kv_lora_rank = config.kv_lora_rank
-            self.v_head_dim = config.v_head_dim
-            self.qk_nope_head_dim = config.qk_nope_head_dim
-            self.q_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-            self.use_nope = config.mla_use_nope
-            self.scaling = self.q_head_dim ** (-0.5)
-        except Exception as e:
-            raise ValueError(
-                f"NekoMind MLA config is not found or not properly formatted: {e}")
-
-        if self.q_lora_rank is not None:
-            self.q_a_proj = nn.Linear(
-                self.hidden_size, self.q_lora_rank, bias=False,
-            )
-            self.q_a_layernorm = NekoMindMoeRMSNorm(self.q_lora_rank)
-            self.q_b_proj = nn.Linear(
-                self.q_lora_rank,
-                self.num_heads * self.q_head_dim,
-                bias=False,
-            )
-        else:
-            self.q_proj = nn.Linear(
-                self.hidden_size, self.num_heads * self.q_head_dim, bias=False,
-            )
-        self.kv_a_proj_with_mqa = nn.Linear(
-            self.hidden_size,
-            self.kv_lora_rank + self.qk_rope_head_dim,
-            bias=False,
-        )
-        self.kv_a_layernorm = NekoMindMoeRMSNorm(self.kv_lora_rank)
-        self.kv_b_proj = nn.Linear(
-            self.kv_lora_rank,
-            self.num_heads
-            * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
-            bias=False,
-        )
-        self.o_proj = nn.Linear(
-            self.num_heads * self.v_head_dim,
-            self.hidden_size,
-            bias=False,
-        )
-        self.is_causal = True
-        assert self.use_nope
-
-        self.use_output_gate = getattr(config, "mla_use_output_gate", False)
-        if self.use_output_gate:
-            projection_size = self.num_heads * self.v_head_dim
-            self.g_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
-
-        self.rotary_emb = None
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None,
         past_key_values: Cache | None = None,
-        **kwargs,
+        **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
         batch_size, seq_length = hidden_states.shape[:-1]
-        query_shape = (batch_size, seq_length, -1, self.q_head_dim)
-        key_shape = (batch_size, seq_length, -1,
-                     self.qk_nope_head_dim + self.v_head_dim)
+        query_shape = (batch_size, seq_length, -1, self.qk_head_dim)
 
-        if self.q_lora_rank is not None:
-            q_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
-        else:
+        if self.q_lora_rank is None:
             q_states = self.q_proj(hidden_states)
-        q_states = q_states.view(query_shape).transpose(1, 2)
-        q_pass, q_rot = torch.split(
-            q_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        else:
+            q_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+        query_states = q_states.view(query_shape).transpose(1, 2)
 
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
-        k_pass, k_rot = torch.split(
-            compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-
-        k_pass = self.kv_b_proj(self.kv_a_layernorm(
-            k_pass)).view(key_shape).transpose(1, 2)
-        k_pass, value_states = torch.split(
-            k_pass, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-
+        kv_nope, k_rot = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv_nope = self.kv_a_layernorm(kv_nope)
+        # Both latents are viewed as single-head, 4D tensors so all cache layers handle them correctly
+        kv_nope = kv_nope.view(batch_size, 1, seq_length, self.kv_lora_rank)
         k_rot = k_rot.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
 
-        k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
-
-        query_states = torch.cat((q_pass, q_rot), dim=-1)
-        key_states = torch.cat((k_pass, k_rot), dim=-1)
-
+        # Cache read / write is performed while latent KV is still compressed
         if past_key_values is not None:
-            key_states, value_states = past_key_values.update(
-                key_states, value_states, self.layer_idx)
+            kv_nope, k_rot = past_key_values.update(kv_nope, k_rot, self.layer_idx)
 
-        if self.config._attn_implementation == "flash_attention_2" and self.q_head_dim != self.v_head_dim:
-            value_states = F.pad(
-                value_states, [0, self.q_head_dim - self.v_head_dim])
+        key_states, value_states = self.expand_kv(kv_nope, k_rot)
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config._attn_implementation, eager_attention_forward
+        )
 
-        attn_output, _ = attention_interface(
+        attn_output, attn_weights = attention_interface(
             self,
             query_states,
             key_states,
@@ -683,16 +252,42 @@ class NekoMindMoeMLAAttention(nn.Module):
             **kwargs,
         )
 
-        if self.config._attn_implementation == "flash_attention_2" and self.q_head_dim != self.v_head_dim:
-            attn_output = attn_output[:, :, :, : self.v_head_dim]
-
-        attn_output = attn_output.reshape(
-            batch_size, seq_length, -1).contiguous()
-        if self.use_output_gate:
-            g = self.g_proj(hidden_states).sigmoid()
-            attn_output = attn_output * g
+        attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        return attn_output
+        return attn_output, attn_weights
+
+
+class NekoMindMoeForgetGate(Glm5NextTextForgetGate):
+    """Same as Glm5NextTextForgetGate but with no gate_lower_bound and no A_log reshape."""
+
+    def __init__(self, config: NekoMindMoeConfig):
+        super().__init__(config)
+        self.A_log = nn.Parameter(torch.empty(1, 1, self.num_heads, 1))
+        del self.safe_gate_lower_bound
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_shape = (*hidden_states.shape[:2], -1, self.head_dim)
+
+        forget_gate = self.f_b_proj(self.f_a_proj(hidden_states))
+        g = (forget_gate.float() + self.dt_bias.float().view(1, 1, -1)).view(hidden_shape)
+        A_log = self.A_log.float()
+        decay_rate = torch.exp(A_log)
+
+        # Softplus "log(1 + exp(x))" with uper bound restraint to avoid overflows
+        # NOTE: Softplus for larger values (e.g. 20+), Softplus(x) == x
+        g_softplus = torch.where(g > 20.0, g, torch.log(1.0 + torch.exp(g)))
+
+        return -decay_rate * g_softplus
+
+
+class NekoMindMoeLinearDeltaAttention(Glm5NextTextLinearAttention):
+    """Kimi Linear Attention: this is essentialy the same a gated delta net (GDN) but decay is per-channel instead of
+    per-token."""
+
+    def __init__(self, config: NekoMindMoeConfig, layer_idx: int):
+        super().__init__(config, layer_idx)
+        self.forget_gate = NekoMindMoeForgetGate(config)
+        self.o_norm = NekoMindMoeRMSNormGated(self.head_dim, eps=self.layer_norm_epsilon)
 
 
 class NekoMindMoeMLP(GemmaMLP):
@@ -760,25 +355,31 @@ class NekoMindMoeRMSNorm(LlamaRMSNorm):
     pass
 
 
-class NekoMindMoeDecoderLayer(nn.Module):
+class NekoMindMoeRMSNormGated(Glm5NextTextRMSNormGated):
+    pass
+
+
+class NekoMindMoeDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: NekoMindMoeConfig, layer_idx: int):
         super().__init__()
-        self.is_linear_attn = config.is_kda_layer(layer_idx)
-        if self.is_linear_attn:
-            self.self_attn = NekoMindMoeDeltaAttention(config, layer_idx)
-        elif config.is_mla:
-            self.self_attn = NekoMindMoeMLAAttention(config, layer_idx)
-        else:
-            raise NotImplementedError
+        self.hidden_size = config.hidden_size
+        self.self_attn = (
+            # CODEPATH: TODO: remove this once the mlinter rule is relaxed
+            NekoMindMoeLinearAttention(config, layer_idx)
+            if config.layer_types[layer_idx] == "full_attention"
+            else NekoMindMoeLinearDeltaAttention(config, layer_idx)
+        )
+
         if (layer_idx not in config.mlp_only_layers) and (
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
             self.mlp = NekoMindMoeSparseMoeBlock(config)
         else:
             self.mlp = NekoMindMoeMLP(config, intermediate_size=config.intermediate_size)
-        self.input_layernorm = NekoMindMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = NekoMindMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.hidden_size = config.hidden_size
+
+        self.input_layernorm = NekoMindMoeRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = NekoMindMoeRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.block_type = config.layer_types[layer_idx]
 
     def forward(
         self,
@@ -790,17 +391,17 @@ class NekoMindMoeDecoderLayer(nn.Module):
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
+        # Self attn
         hidden_states = self.input_layernorm(hidden_states)
-        # Self Attention
-        if self.is_linear_attn:
+        if self.block_type == "linear_attention":
             hidden_states = self.self_attn(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask,
                 cache_params=past_key_values,
+                attention_mask=attention_mask,
                 **kwargs,
             )
         else:
-            hidden_states = self.self_attn(
+            hidden_states, _ = self.self_attn(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -820,69 +421,54 @@ class NekoMindMoeDecoderLayer(nn.Module):
 
 @auto_docstring
 class NekoMindMoePreTrainedModel(PreTrainedModel):
-    config_class = NekoMindMoeConfig
+    config: NekoMindMoeConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["NekoMindMoeDecoderLayer"]
+    _no_split_modules = ["KimiLinearDecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
-    _supports_flash_attn_2 = True
+    _supports_flash_attn = True
+    _supports_sdpa = True
+    _keys_to_ignore_on_load_unexpected = None
     _can_record_outputs = {
-        "router_logits": OutputRecorder(NekoMindMoeMLP, index=1),
+        "router_logits": OutputRecorder(NekoMindMoeTopKRouter, index=0),
         "hidden_states": NekoMindMoeDecoderLayer,
-        "attentions": NekoMindMoeMLAAttention,
+        "attentions": NekoMindMoeLinearAttention,
     }
     _is_stateful = True
+    _can_compile_fullgraph = True
 
+    @torch.no_grad()
     def _init_weights(self, module):
-        std = self.config.initializer_range
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
+        super()._init_weights(module)
+        if isinstance(module, NekoMindMoeForgetGate):  # following FLA initialization
+            # A_log
+            init.copy_(module.A_log, init.uniform_(module.A_log, a=1.0, b=16.0).log())
+            # dt_bias
+            init.uniform_(module.dt_bias, a=math.log(1e-3), b=math.log(1e-1))
+            dt = module.dt_bias.exp().clamp_min(1e-4)
+            init.copy_(module.dt_bias, dt + torch.log(-torch.expm1(-dt)))  # (stable) inverse softplus
+        elif isinstance(module, NekoMindMoeExperts):
+            init.normal_(module.gate_up_proj, mean=0.0, std=self.config.initializer_range)
+            init.normal_(module.down_proj, mean=0.0, std=self.config.initializer_range)
+        elif isinstance(module, NekoMindMoeTopKRouter):
+            init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+            init.zeros_(module.e_score_correction_bias)
+        elif isinstance(module, NekoMindMoeRMSNormGated):
+            init.ones_(module.weight)
 
 
 @auto_docstring
 class NekoMindMoeModel(NekoMindMoePreTrainedModel):
     def __init__(self, config: NekoMindMoeConfig):
         super().__init__(config)
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
         self.layers = nn.ModuleList(
             [NekoMindMoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = NekoMindMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-        if getattr(config, "_attn_implementation", None) is not None:
-            if config._attn_implementation != "flash_attention_2":
-                logger.warning_once(
-                    f"Ignoring the provided attention implementation {config._attn_implementation}")
-                logger.warning_once("Using flash_attention_2 backend instead.")
-                config._attn_implementation = "flash_attention_2"
-        else:
-            config._attn_implementation = "flash_attention_2"
-
-        self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         self.post_init()
-
-    def _update_linear_attn_mask(self, attention_mask, cache_position):
-        """
-        NOTE: Left-padding is used for linear attention mask.
-        No need for zeroing states when
-            1. Cached forward
-            2. Attending to all inputs
-        """
-        linear_attn_mask = attention_mask
-        if cache_position[0] > 0 or (attention_mask is not None and torch.all(attention_mask == 1)):
-            linear_attn_mask = None
-        return linear_attn_mask
 
     @merge_with_config_defaults
     @capture_outputs
@@ -900,55 +486,47 @@ class NekoMindMoeModel(NekoMindMoePreTrainedModel):
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-        if use_cache and past_key_values is None:
-            past_key_values = NekoMindMoeDynamicCache(config=self.config)
-
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
-            past_key_values = NekoMindMoeDynamicCache(config=self.config)
-
-        if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length(
-            ) if past_key_values is not None else 0
-            cache_position: torch.Tensor = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device,
-            )
+            past_key_values = DynamicCache(config=self.config)
 
         if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            position_ids: torch.LongTensor = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
+            position_ids = (position_ids + past_seen_tokens).unsqueeze(0)
 
-        causal_mask = create_causal_mask(
-            config=self.config,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
-        )
-        linear_attn_mask = self._update_linear_attn_mask(
-            attention_mask, cache_position)
+        if not isinstance(causal_mask_mapping := attention_mask, dict):
+            # Prepare mask arguments
+            mask_kwargs = {
+                "config": self.config,
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+            }
+            # Create the masks
+            causal_mask_mapping = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+                "linear_attention": create_recurrent_attention_mask(**mask_kwargs),
+            }
 
         hidden_states = inputs_embeds
-        if past_key_values is not None:
-            assert isinstance(past_key_values, NekoMindMoeDynamicCache)
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-            layer_mask = linear_attn_mask if decoder_layer.is_linear_attn else causal_mask
+        for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             hidden_states = decoder_layer(
                 hidden_states,
-                attention_mask=layer_mask,
+                attention_mask=causal_mask_mapping[self.config.layer_types[i]],
+                position_ids=position_ids,
                 past_key_values=past_key_values,
-                cache_position=cache_position,
+                use_cache=use_cache,
                 **kwargs,
             )
 
-        if past_key_values is not None:
-            past_key_values._seen_tokens = past_seen_tokens + inputs_embeds.shape[1]
         hidden_states = self.norm(hidden_states)
 
-        return MoeModelOutputWithPast(  # only diff with Mistral is the output type, we need MoE
+        return MoeModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
         )
@@ -956,17 +534,16 @@ class NekoMindMoeModel(NekoMindMoePreTrainedModel):
 
 @auto_docstring
 class NekoMindMoeForCausalLM(NekoMindMoePreTrainedModel, GenerationMixin):
-    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    _tied_weights_keys = {}
     _tp_plan = {"lm_head": "colwise_gather_output"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+    _fsdp_plan = {"lm_head": "keep_full_weight"}
 
     def __init__(self, config):
         super().__init__(config)
         self.model = NekoMindMoeModel(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(
-            config.hidden_size, config.vocab_size, bias=False)
-        self.num_experts = config.num_experts
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -982,10 +559,9 @@ class NekoMindMoeForCausalLM(NekoMindMoePreTrainedModel, GenerationMixin):
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
-        output_router_logits: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> MoeCausalLMOutputWithPast:
+    ) -> MoeModelOutputWithPast:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
