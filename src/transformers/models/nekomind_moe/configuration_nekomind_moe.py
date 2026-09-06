@@ -29,11 +29,6 @@ class NekoMindMoeConfig(PreTrainedConfig):
     r"""
     decoder_sparse_step (`int`, *optional*, defaults to 1):
         The frequency of the MoE layer.
-    linear_attn_config (`dict`, *optional*):
-        KDA configuration. `kda_layers` and `full_attn_layers` use **1-based** layer numbers.
-        KDA layers require `short_conv_kernel_size`, `head_dim`, and `num_heads`.
-        Optional `use_full_rank_gate` defaults to `False`; `gate_lower_bound` defaults to `None`.
-        Layers selected by `kda_layers` use KDA; all other layers use MLA. When unset, all layers use MLA.
     q_lora_rank (`int`, *optional*):
         Query compression rank. When unset, use a direct query projection.
     kv_lora_rank (`int`, *optional*):
@@ -48,10 +43,8 @@ class NekoMindMoeConfig(PreTrainedConfig):
         Use NoPE attention. MLA asserts that this is enabled.
     mla_use_output_gate (`bool`, *optional*, defaults to `False`):
         Apply sigmoid output gate before the MLA output projection.
-    mlp_only_layers (`list[int]`, *optional*, defaults to `[]`):
-        Indicate which layers use NekoMindMoeMLP rather than NekoMindMoeSparseMoeBlock
-        The list contains layer index, from 0 to num_layers-1 if we have num_layers layers
-        If `mlp_only_layers` is empty, `decoder_sparse_step` is used to determine the sparsity.
+    mlp_layer_types (`list[str]`, *optional*):
+        List of layer types for the MLP or MoE layers. Defaults to None.
 
     ```python
     >>> from transformers import NekoMindMoeModel, NekoMindMoeConfig
@@ -105,7 +98,6 @@ class NekoMindMoeConfig(PreTrainedConfig):
     v_head_dim: int | None = 128
     mla_use_nope: bool = True
     mla_use_output_gate: bool = False
-    linear_attn_config: dict | None = None
     hidden_act: str = "silu"
     max_position_embeddings: int = 32768
     initializer_range: float = 0.02
@@ -113,15 +105,15 @@ class NekoMindMoeConfig(PreTrainedConfig):
     use_cache: bool = True
     tie_word_embeddings: bool = False
     attention_dropout: float | int = 0.0
-    decoder_sparse_step: int = 1
     moe_intermediate_size: int = 768
     shared_expert_intermediate_size: int = 768
     num_experts_per_tok: int = 8
-    num_experts: int = 128
+    num_local_experts: int = 128
     norm_topk_prob: bool = False
     output_router_logits: bool = False
     router_aux_loss_coef: float = 0.001
-    mlp_only_layers: list[int] | None = None
+    mlp_layer_types: list[str] | None = None
+    layer_types: list[str] | None = None
     pad_token_id: int | None = None
     bos_token_id: int | None = None
     eos_token_id: int | list[int] | None = None
@@ -135,7 +127,6 @@ class NekoMindMoeConfig(PreTrainedConfig):
             self.num_key_value_heads = self.num_attention_heads
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.head_dim = self.qk_rope_head_dim
-        self.mlp_only_layers = [] if self.mlp_only_layers is None else self.mlp_only_layers
 
         super().__post_init__(**kwargs)
         # Checkpoint stores linear attention attributes in a config sub-dict: if it's there, extract them
@@ -157,6 +148,13 @@ class NekoMindMoeConfig(PreTrainedConfig):
                 self.layer_types = [
                     "full_attention" if i and i % 4 == 0 else "linear_attention" for i in range(self.num_hidden_layers)
                 ]
+
+        # Same for MLP layer types, which indicate MLP or MoE
+        if self.mlp_layer_types is None:
+            first_k_dense_replace = kwargs.get("first_k_dense_replace", 1)
+            self.mlp_layer_types = [
+                "dense" if i < first_k_dense_replace else "sparse" for i in range(self.num_hidden_layers)
+            ]
 
 
 __all__ = ["NekoMindMoeConfig"]

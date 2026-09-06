@@ -785,12 +785,11 @@ class NekoMindMoeDecoderLayer(GradientCheckpointingLayer):
             else NekoMindMoeLinearDeltaAttention(config, layer_idx)
         )
 
-        if (layer_idx not in config.mlp_only_layers) and (
-            config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
-        ):
-            self.mlp = NekoMindMoeSparseMoeBlock(config)
-        else:
-            self.mlp = NekoMindMoeMLP(config, intermediate_size=config.intermediate_size)
+        self.mlp = (
+            NekoMindMoeSparseMoeBlock(config)
+            if config.mlp_layer_types[layer_idx] == "sparse"
+            else NekoMindMoeMLP(config)
+        )
 
         self.input_layernorm = NekoMindMoeRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = NekoMindMoeRMSNorm(config.hidden_size, config.rms_norm_eps)
