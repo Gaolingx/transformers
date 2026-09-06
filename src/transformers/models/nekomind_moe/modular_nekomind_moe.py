@@ -90,6 +90,7 @@ class NekoMindMoeConfig(PreTrainedConfig):
 
     attribute_map = {
         "num_experts": "num_local_experts",
+        "num_experts_per_tok": "num_experts_per_token",
     }
 
     # Default tensor parallel plan for base model `NekoMindMoe`
@@ -133,7 +134,7 @@ class NekoMindMoeConfig(PreTrainedConfig):
     moe_intermediate_size: int = 768
     shared_expert_intermediate_size: int = 768
     num_experts_per_tok: int = 8
-    num_local_experts: int = 128
+    num_experts: int = 128
     norm_topk_prob: bool = False
     output_router_logits: bool = False
     router_aux_loss_coef: float = 0.001
