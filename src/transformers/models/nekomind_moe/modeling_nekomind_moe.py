@@ -211,8 +211,6 @@ class NekoMindMoeAttention(nn.Module):
 
 
 class NekoMindMoeForgetGate(nn.Module):
-    """Same as Glm5NextTextForgetGate but with no gate_lower_bound and no A_log reshape."""
-
     def __init__(self, config: NekoMindMoeConfig):
         super().__init__()
         self.head_dim = config.linear_head_dim
@@ -222,15 +220,21 @@ class NekoMindMoeForgetGate(nn.Module):
         self.f_a_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False)
         self.f_b_proj = nn.Linear(self.head_dim, self.qkv_dim, bias=False)
         self.dt_bias = nn.Parameter(torch.empty(self.qkv_dim))
-        self.A_log = nn.Parameter(torch.empty(1, 1, self.num_heads, 1))
+        self.A_log = nn.Parameter(torch.empty(self.num_heads))
+
+        self.safe_gate_lower_bound = config.linear_lower_bound
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_shape = (*hidden_states.shape[:2], -1, self.head_dim)
 
         forget_gate = self.f_b_proj(self.f_a_proj(hidden_states))
         g = (forget_gate.float() + self.dt_bias.float().view(1, 1, -1)).view(hidden_shape)
-        A_log = self.A_log.float()
+        A_log = self.A_log.float().view(1, 1, self.num_heads, 1)
         decay_rate = torch.exp(A_log)
+
+        # Safe lower bound decay
+        if self.safe_gate_lower_bound is not None:
+            return self.safe_gate_lower_bound * torch.sigmoid(decay_rate * g)
 
         # Softplus "log(1 + exp(x))" with uper bound restraint to avoid overflows
         # NOTE: Softplus for larger values (e.g. 20+), Softplus(x) == x

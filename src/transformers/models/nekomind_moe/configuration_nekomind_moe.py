@@ -99,6 +99,7 @@ class NekoMindMoeConfig(PreTrainedConfig):
     v_head_dim: int | None = 128
     mla_use_nope: bool = True
     mla_use_output_gate: bool = False
+    linear_lower_bound: float | None = -5.0
     hidden_act: str = "silu"
     max_position_embeddings: int = 32768
     initializer_range: float = 0.02
@@ -106,6 +107,7 @@ class NekoMindMoeConfig(PreTrainedConfig):
     use_cache: bool = True
     tie_word_embeddings: bool = False
     attention_dropout: float | int = 0.0
+    attention_bias: bool = False
     moe_intermediate_size: int = 768
     shared_expert_intermediate_size: int = 768
     num_experts_per_tok: int = 8
@@ -135,6 +137,7 @@ class NekoMindMoeConfig(PreTrainedConfig):
         self.linear_head_dim = linear_attn_config.get("head_dim", self.linear_head_dim)
         self.linear_num_heads = linear_attn_config.get("num_heads", self.linear_num_heads)
         self.linear_conv_kernel_dim = linear_attn_config.get("short_conv_kernel_size", self.linear_conv_kernel_dim)
+        self.linear_lower_bound = linear_attn_config.get("gate_lower_bound", self.linear_lower_bound)
 
         # For layer types, the precedence is: checkpoint config > layer types > default
         if self.layer_types is None:
