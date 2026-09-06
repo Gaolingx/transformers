@@ -183,7 +183,7 @@ class NekoMindMoeConfig(PreTrainedConfig):
             ]
 
 
-class NekoMindMoeLinearAttention(DeepseekV3Attention):
+class NekoMindMoeAttention(DeepseekV3Attention):
     """Multi-headed Latent Attention (MLA) from Deepseek V2 with NoPE, but the part of the keys where RoPE is applied is
     still shared."""
 
@@ -263,7 +263,7 @@ class NekoMindMoeForgetGate(Glm5NextTextForgetGate):
         return -decay_rate * g_softplus
 
 
-class NekoMindMoeLinearDeltaAttention(Glm5NextTextLinearAttention):
+class NekoMindMoeDeltaAttention(Glm5NextTextLinearAttention):
     """Kimi Linear Attention: this is essentialy the same a gated delta net (GDN) but decay is per-channel instead of
     per-token."""
 
@@ -348,9 +348,9 @@ class NekoMindMoeDecoderLayer(GradientCheckpointingLayer):
         self.hidden_size = config.hidden_size
         self.self_attn = (
             # CODEPATH: TODO: remove this once the mlinter rule is relaxed
-            NekoMindMoeLinearAttention(config, layer_idx)
+            NekoMindMoeAttention(config, layer_idx)
             if config.layer_types[layer_idx] == "full_attention"
-            else NekoMindMoeLinearDeltaAttention(config, layer_idx)
+            else NekoMindMoeDeltaAttention(config, layer_idx)
         )
 
         self.mlp = NekoMindMoeSparseMoeBlock(config) if config.mlp_layer_types[layer_idx] == "sparse" else NekoMindMoeMLP(config)
@@ -410,7 +410,7 @@ class NekoMindMoePreTrainedModel(PreTrainedModel):
     _can_record_outputs = {
         "router_logits": OutputRecorder(NekoMindMoeTopKRouter, index=0),
         "hidden_states": NekoMindMoeDecoderLayer,
-        "attentions": NekoMindMoeLinearAttention,
+        "attentions": NekoMindMoeAttention,
     }
     _is_stateful = True
     _can_compile_fullgraph = True

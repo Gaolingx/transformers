@@ -47,27 +47,6 @@ from ...utils.output_capturing import OutputRecorder, capture_outputs
 from .configuration_nekomind_moe import NekoMindMoeConfig
 
 
-@use_kernel_forward_from_hub("RMSNorm")
-class NekoMindMoeLinearRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
-        """
-        NekoMindMoeLinearRMSNorm is equivalent to T5LayerNorm
-        """
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
-
-    def extra_repr(self):
-        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
-
-
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -105,7 +84,7 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
-class NekoMindMoeLinearAttention(nn.Module):
+class NekoMindMoeAttention(nn.Module):
     """Multi-headed Latent Attention (MLA) from Deepseek V2 with NoPE, but the part of the keys where RoPE is applied is
     still shared."""
 
@@ -137,7 +116,7 @@ class NekoMindMoeLinearAttention(nn.Module):
             if self.q_lora_rank is not None
             else None
         )
-        self.q_a_layernorm = NekoMindMoeLinearRMSNorm(config.q_lora_rank) if self.q_lora_rank is not None else None
+        self.q_a_layernorm = NekoMindMoeRMSNorm(config.q_lora_rank) if self.q_lora_rank is not None else None
         self.q_b_proj = (
             nn.Linear(config.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False)
             if self.q_lora_rank is not None
@@ -149,7 +128,7 @@ class NekoMindMoeLinearAttention(nn.Module):
             config.kv_lora_rank + config.qk_rope_head_dim,
             bias=config.attention_bias,
         )
-        self.kv_a_layernorm = NekoMindMoeLinearRMSNorm(config.kv_lora_rank)
+        self.kv_a_layernorm = NekoMindMoeRMSNorm(config.kv_lora_rank)
         self.kv_b_proj = nn.Linear(
             config.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -483,7 +462,7 @@ def chunk_kimi_delta_attention(
 @use_kernelized_func(
     [chunk_kimi_delta_attention, recurrent_kimi_delta_attention, causal_conv1d_fn, causal_conv1d_update]
 )
-class NekoMindMoeLinearDeltaAttention(nn.Module):
+class NekoMindMoeDeltaAttention(nn.Module):
     """Kimi Linear Attention: this is essentialy the same a gated delta net (GDN) but decay is per-channel instead of
     per-token."""
 
@@ -780,9 +759,9 @@ class NekoMindMoeDecoderLayer(GradientCheckpointingLayer):
         self.hidden_size = config.hidden_size
         self.self_attn = (
             # CODEPATH: TODO: remove this once the mlinter rule is relaxed
-            NekoMindMoeLinearAttention(config, layer_idx)
+            NekoMindMoeAttention(config, layer_idx)
             if config.layer_types[layer_idx] == "full_attention"
-            else NekoMindMoeLinearDeltaAttention(config, layer_idx)
+            else NekoMindMoeDeltaAttention(config, layer_idx)
         )
 
         self.mlp = (
@@ -846,7 +825,7 @@ class NekoMindMoePreTrainedModel(PreTrainedModel):
     _can_record_outputs = {
         "router_logits": OutputRecorder(NekoMindMoeTopKRouter, index=0),
         "hidden_states": NekoMindMoeDecoderLayer,
-        "attentions": NekoMindMoeLinearAttention,
+        "attentions": NekoMindMoeAttention,
     }
     _is_stateful = True
     _can_compile_fullgraph = True
