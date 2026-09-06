@@ -20,7 +20,6 @@
 from huggingface_hub.dataclasses import strict
 
 from ...configuration_utils import PreTrainedConfig
-from ...modeling_rope_utils import RopeParameters
 from ...utils import auto_docstring
 
 
@@ -30,6 +29,25 @@ class NekoMindMoeConfig(PreTrainedConfig):
     r"""
     decoder_sparse_step (`int`, *optional*, defaults to 1):
         The frequency of the MoE layer.
+    linear_attn_config (`dict`, *optional*):
+        KDA configuration. `kda_layers` and `full_attn_layers` use **1-based** layer numbers.
+        KDA layers require `short_conv_kernel_size`, `head_dim`, and `num_heads`.
+        Optional `use_full_rank_gate` defaults to `False`; `gate_lower_bound` defaults to `None`.
+        Layers selected by `kda_layers` use KDA; all other layers use MLA. When unset, all layers use MLA.
+    q_lora_rank (`int`, *optional*):
+        Query compression rank. When unset, use a direct query projection.
+    kv_lora_rank (`int`, *optional*):
+        MLA KV compression rank; must be supplied for MLA layers.
+    qk_nope_head_dim (`int`, *optional*):
+        Per-head Q/K dimension; must be supplied for MLA layers.
+    qk_rope_head_dim (`int`, *optional*):
+        Additional Q/shared-K dimension, without rotary encoding. Must be supplied (may be 0).
+    v_head_dim (`int`, *optional*):
+        Per-head value dimension; must be supplied for MLA layers.
+    mla_use_nope (`bool`, *optional*, defaults to `True`):
+        Use NoPE attention. MLA asserts that this is enabled.
+    mla_use_output_gate (`bool`, *optional*, defaults to `False`):
+        Apply sigmoid output gate before the MLA output projection.
     mlp_only_layers (`list[int]`, *optional*, defaults to `[]`):
         Indicate which layers use NekoMindMoeMLP rather than NekoMindMoeSparseMoeBlock
         The list contains layer index, from 0 to num_layers-1 if we have num_layers layers
@@ -58,15 +76,12 @@ class NekoMindMoeConfig(PreTrainedConfig):
 
     # Default tensor parallel plan for base model `NekoMindMoe`
     base_model_tp_plan = {
-        "layers.*.self_attn.q_proj": "colwise",
-        "layers.*.self_attn.k_proj": "colwise",
-        "layers.*.self_attn.v_proj": "colwise",
-        "layers.*.self_attn.q_norm": "replicated_with_grad_allreduce",
-        "layers.*.self_attn.k_norm": "replicated_with_grad_allreduce",
-        "layers.*.self_attn.o_proj": "rowwise",
         "layers.*.mlp.experts.gate_up_proj": "packed_colwise",
         "layers.*.mlp.experts.down_proj": "rowwise",
         "layers.*.mlp.experts": "moe_tp_experts",
+        "layers.*.mlp.shared_experts.gate_proj": "colwise",
+        "layers.*.mlp.shared_experts.up_proj": "colwise",
+        "layers.*.mlp.shared_experts.down_proj": "rowwise",
         "layers.*.mlp.gate_proj": "colwise",
         "layers.*.mlp.up_proj": "colwise",
         "layers.*.mlp.down_proj": "rowwise",
@@ -82,17 +97,21 @@ class NekoMindMoeConfig(PreTrainedConfig):
     intermediate_size: int = 6144
     num_hidden_layers: int = 24
     num_attention_heads: int = 32
-    num_key_value_heads: int = 4
+    num_key_value_heads: int | None = 32
+    q_lora_rank: int | None = None
+    kv_lora_rank: int | None = None
+    qk_nope_head_dim: int = 128
+    qk_rope_head_dim: int = 64
+    v_head_dim: int | None = 128
+    mla_use_nope: bool = True
+    mla_use_output_gate: bool = False
+    linear_attn_config: dict | None = None
     hidden_act: str = "silu"
     max_position_embeddings: int = 32768
     initializer_range: float = 0.02
     rms_norm_eps: float = 1e-6
     use_cache: bool = True
     tie_word_embeddings: bool = False
-    rope_parameters: RopeParameters | dict | None = None
-    attention_bias: bool = False
-    use_sliding_window: bool = False
-    sliding_window: int | None = 4096
     attention_dropout: float | int = 0.0
     decoder_sparse_step: int = 1
     moe_intermediate_size: int = 768
@@ -107,10 +126,37 @@ class NekoMindMoeConfig(PreTrainedConfig):
     bos_token_id: int | None = None
     eos_token_id: int | list[int] | None = None
 
+    linear_head_dim: int = 128
+    linear_num_heads: int = 32
+    linear_conv_kernel_dim: int = 4
+
     def __post_init__(self, **kwargs):
-        self.sliding_window = self.sliding_window if self.use_sliding_window else None
+        if self.num_key_value_heads is None:
+            self.num_key_value_heads = self.num_attention_heads
+        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.head_dim = self.qk_rope_head_dim
         self.mlp_only_layers = [] if self.mlp_only_layers is None else self.mlp_only_layers
+
         super().__post_init__(**kwargs)
+        # Checkpoint stores linear attention attributes in a config sub-dict: if it's there, extract them
+        linear_attn_config = kwargs.get("linear_attn_config", {})
+        self.linear_head_dim = linear_attn_config.get("head_dim", self.linear_head_dim)
+        self.linear_num_heads = linear_attn_config.get("num_heads", self.linear_num_heads)
+        self.linear_conv_kernel_dim = linear_attn_config.get("short_conv_kernel_size", self.linear_conv_kernel_dim)
+
+        # For layer types, the precedence is: checkpoint config > layer types > default
+        if self.layer_types is None:
+            if "full_attn_layers" in linear_attn_config and "kda_layers" in linear_attn_config:
+                layer_types = [None] * self.num_hidden_layers
+                for layer in linear_attn_config["full_attn_layers"]:
+                    layer_types[layer - 1] = "full_attention"  # types are 1-indexed in the checkpoint
+                for layer in linear_attn_config["kda_layers"]:
+                    layer_types[layer - 1] = "linear_attention"
+                self.layer_types = layer_types
+            else:
+                self.layer_types = [
+                    "full_attention" if i and i % 4 == 0 else "linear_attention" for i in range(self.num_hidden_layers)
+                ]
 
 
 __all__ = ["NekoMindMoeConfig"]
