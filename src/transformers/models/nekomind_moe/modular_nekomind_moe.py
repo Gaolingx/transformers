@@ -104,20 +104,12 @@ class NekoMindMoeConfig(PreTrainedConfig):
 
     # Default tensor parallel plan for base model `NekoMindMoe`
     base_model_tp_plan = {
-        "layers.*.self_attn.q_proj": "colwise",
-        "layers.*.self_attn.k_proj": "colwise",
-        "layers.*.self_attn.v_proj": "colwise",
-        "layers.*.self_attn.q_a_proj": "replicated_with_grad_allreduce",
-        "layers.*.self_attn.q_a_layernorm": "replicated_with_grad_allreduce",
-        "layers.*.self_attn.q_b_proj": "colwise",
-        "layers.*.self_attn.kv_a_proj_with_mqa": "replicated_with_grad_allreduce",
-        "layers.*.self_attn.kv_a_layernorm": "replicated_with_grad_allreduce",
-        "layers.*.self_attn.kv_b_proj": "colwise",
-        "layers.*.self_attn.g_proj": "colwise",
-        "layers.*.self_attn.o_proj": "rowwise",
         "layers.*.mlp.experts.gate_up_proj": "packed_colwise",
         "layers.*.mlp.experts.down_proj": "rowwise",
         "layers.*.mlp.experts": "moe_tp_experts",
+        "layers.*.mlp.shared_experts.gate_proj": "colwise",
+        "layers.*.mlp.shared_experts.up_proj": "colwise",
+        "layers.*.mlp.shared_experts.down_proj": "rowwise",
         "layers.*.mlp.gate_proj": "colwise",
         "layers.*.mlp.up_proj": "colwise",
         "layers.*.mlp.down_proj": "rowwise",
