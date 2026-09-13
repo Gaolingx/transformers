@@ -435,6 +435,7 @@ CONFIG_MAPPING_NAMES = OrderedDict(
         ("musicgen_melody_decoder", "MusicgenMelodyDecoderConfig"),
         ("mvp", "MvpConfig"),
         ("nanochat", "NanoChatConfig"),
+        ("nekomind_moe2", "NekoMindMoe2Config"),
         ("nemotron", "NemotronConfig"),
         ("nemotron3_5_asr", "Nemotron3_5AsrConfig"),
         ("nemotron_asr_streaming", "NemotronAsrStreamingConfig"),

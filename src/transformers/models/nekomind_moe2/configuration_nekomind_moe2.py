@@ -39,15 +39,17 @@ class NekoMindMoe2Config(PreTrainedConfig):
         Number of heads for the linear attention layers. Defaults to 32.
     linear_conv_kernel_dim (`int`, *optional*, defaults to 4):
         Kernel size for the short convolution applied to queries, keys, and values in linear attention layers.
+    linear_lower_bound (`float`, *optional*, defaults to -5.0):
+        Whether the forget gate has a lower bound to apply to the decay.
 
     ```python
-    >>> from transformers import NekoMindMoeModel2, NekoMindMoeConfig2
+    >>> from transformers import NekoMindMoe2Model, NekoMindMoe2Config
 
-    >>> # Initializing a NekoMindMoE style configuration
-    >>> configuration = NekoMindMoeConfig2()
+    >>> # Initializing a NekoMind2 style configuration
+    >>> configuration = NekoMindMoe2Config()
 
-    >>> # Initializing a model from the NekoMind1.5-Base" style configuration
-    >>> model = NekoMindMoeModel2(configuration)
+    >>> # Initializing a model from the NekoMind1.5-Base style configuration
+    >>> model = NekoMindMoe2Model(configuration)
 
     >>> # Accessing the model configuration
     >>> configuration = model.config
@@ -67,9 +69,9 @@ class NekoMindMoe2Config(PreTrainedConfig):
         "layers.*.mlp.experts.gate_up_proj": "packed_colwise",
         "layers.*.mlp.experts.down_proj": "rowwise",
         "layers.*.mlp.experts": "moe_tp_experts",
-        "layers.*.mlp.shared_experts.gate_proj": "colwise",
-        "layers.*.mlp.shared_experts.up_proj": "colwise",
-        "layers.*.mlp.shared_experts.down_proj": "rowwise",
+        "layers.*.mlp.shared_expert.gate_proj": "colwise",
+        "layers.*.mlp.shared_expert.up_proj": "colwise",
+        "layers.*.mlp.shared_expert.down_proj": "rowwise",
         "layers.*.mlp.gate_proj": "colwise",
         "layers.*.mlp.up_proj": "colwise",
         "layers.*.mlp.down_proj": "rowwise",
@@ -78,6 +80,12 @@ class NekoMindMoe2Config(PreTrainedConfig):
         "embed_tokens": (["input_ids"], ["inputs_embeds"]),
         "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
         "norm": (["hidden_states"], ["hidden_states"]),
+    }
+    base_model_ep_plan = {
+        "layers.*.mlp.gate": "ep_router",
+        "layers.*.mlp.experts.gate_up_proj": "grouped_gemm",
+        "layers.*.mlp.experts.down_proj": "grouped_gemm",
+        "layers.*.mlp.experts": "moe_tp_experts",
     }
 
     vocab_size: int = 151936

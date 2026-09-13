@@ -324,6 +324,7 @@ if TYPE_CHECKING:
     from .mvp import *
     from .myt5 import *
     from .nanochat import *
+    from .nekomind_moe2 import *
     from .nemotron import *
     from .nemotron3_5_asr import *
     from .nemotron_asr_streaming import *
