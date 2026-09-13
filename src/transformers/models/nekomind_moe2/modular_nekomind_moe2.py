@@ -50,7 +50,7 @@ logger = logging.get_logger(__name__)
 
 @auto_docstring(checkpoint="nekocyrene/NekoMind1.5-Base")
 @strict
-class NekoMindMoeConfig(PreTrainedConfig):
+class NekoMindMoe2Config(PreTrainedConfig):
     r"""
     mla_use_nope (`bool`, *optional*, defaults to `True`):
         Use NoPE attention. MLA asserts that this is enabled.
@@ -66,20 +66,20 @@ class NekoMindMoeConfig(PreTrainedConfig):
         Kernel size for the short convolution applied to queries, keys, and values in linear attention layers.
 
     ```python
-    >>> from transformers import NekoMindMoeModel, NekoMindMoeConfig
+    >>> from transformers import NekoMindMoeModel2, NekoMindMoeConfig2
 
     >>> # Initializing a NekoMindMoE style configuration
-    >>> configuration = NekoMindMoeConfig()
+    >>> configuration = NekoMindMoeConfig2()
 
     >>> # Initializing a model from the NekoMind1.5-Base" style configuration
-    >>> model = NekoMindMoeModel(configuration)
+    >>> model = NekoMindMoeModel2(configuration)
 
     >>> # Accessing the model configuration
     >>> configuration = model.config
     ```
     """
 
-    model_type = "nekomind_moe"
+    model_type = "nekomind_moe2"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     attribute_map = {
@@ -180,11 +180,11 @@ class NekoMindMoeConfig(PreTrainedConfig):
             ]
 
 
-class NekoMindMoeAttention(DeepseekV3Attention):
+class NekoMindMoe2Attention(DeepseekV3Attention):
     """Multi-headed Latent Attention (MLA) from Deepseek V2 with NoPE, but the part of the keys where RoPE is applied is
     still shared."""
 
-    def __init__(self, config: NekoMindMoeConfig, layer_idx: int):
+    def __init__(self, config: NekoMindMoe2Config, layer_idx: int):
         super().__init__(config, layer_idx)
         self.scaling = self.qk_head_dim ** (-0.5)
 
@@ -244,23 +244,23 @@ class NekoMindMoeAttention(DeepseekV3Attention):
         return attn_output, attn_weights
 
 
-class NekoMindMoeForgetGate(Glm5NextTextForgetGate):
+class NekoMindMoe2ForgetGate(Glm5NextTextForgetGate):
 
-    def __init__(self, config: NekoMindMoeConfig):
+    def __init__(self, config: NekoMindMoe2Config):
         super().__init__(config)
 
 
-class NekoMindMoeDeltaAttention(Glm5NextTextLinearAttention):
+class NekoMindMoe2DeltaAttention(Glm5NextTextLinearAttention):
     """Kimi Linear Attention: this is essentialy the same a gated delta net (GDN) but decay is per-channel instead of
     per-token."""
 
-    def __init__(self, config: NekoMindMoeConfig, layer_idx: int):
+    def __init__(self, config: NekoMindMoe2Config, layer_idx: int):
         super().__init__(config, layer_idx)
-        self.forget_gate = NekoMindMoeForgetGate(config)
-        self.o_norm = NekoMindMoeRMSNormGated(self.head_dim, eps=self.layer_norm_epsilon)
+        self.forget_gate = NekoMindMoe2ForgetGate(config)
+        self.o_norm = NekoMindMoe2RMSNormGated(self.head_dim, eps=self.layer_norm_epsilon)
 
 
-class NekoMindMoeMLP(GemmaMLP):
+class NekoMindMoe2MLP(GemmaMLP):
     def __init__(self, config, intermediate_size=None):
         super().__init__()
         self.config = config
@@ -272,14 +272,14 @@ class NekoMindMoeMLP(GemmaMLP):
         self.act_fn = ACT2FN[config.hidden_act]
 
 
-class NekoMindMoeExperts(MixtralExperts):
+class NekoMindMoe2Experts(MixtralExperts):
     def __init__(self, config):
         super().__init__(config)
         self.num_experts = config.num_experts
         self.intermediate_dim = config.moe_intermediate_size
 
 
-class NekoMindMoeTopKRouter(nn.Module):
+class NekoMindMoe2TopKRouter(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.top_k = config.num_experts_per_tok
@@ -299,12 +299,12 @@ class NekoMindMoeTopKRouter(nn.Module):
         return router_logits, router_scores, router_indices
 
 
-class NekoMindMoeSparseMoeBlock(nn.Module):
-    def __init__(self, config: NekoMindMoeConfig):
+class NekoMindMoe2SparseMoeBlock(nn.Module):
+    def __init__(self, config: NekoMindMoe2Config):
         super().__init__()
-        self.experts = NekoMindMoeExperts(config)
-        self.gate = NekoMindMoeTopKRouter(config)
-        self.shared_expert = NekoMindMoeMLP(config, intermediate_size=config.shared_expert_intermediate_size)
+        self.experts = NekoMindMoe2Experts(config)
+        self.gate = NekoMindMoe2TopKRouter(config)
+        self.shared_expert = NekoMindMoe2MLP(config, intermediate_size=config.shared_expert_intermediate_size)
         self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -321,29 +321,29 @@ class NekoMindMoeSparseMoeBlock(nn.Module):
         return expert_output
 
 
-class NekoMindMoeRMSNorm(LlamaRMSNorm):
+class NekoMindMoe2RMSNorm(LlamaRMSNorm):
     pass
 
 
-class NekoMindMoeRMSNormGated(Glm5NextTextRMSNormGated):
+class NekoMindMoe2RMSNormGated(Glm5NextTextRMSNormGated):
     pass
 
 
-class NekoMindMoeDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: NekoMindMoeConfig, layer_idx: int):
+class NekoMindMoe2DecoderLayer(GradientCheckpointingLayer):
+    def __init__(self, config: NekoMindMoe2Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = (
             # CODEPATH: TODO: remove this once the mlinter rule is relaxed
-            NekoMindMoeAttention(config, layer_idx)
+            NekoMindMoe2Attention(config, layer_idx)
             if config.layer_types[layer_idx] == "full_attention"
-            else NekoMindMoeDeltaAttention(config, layer_idx)
+            else NekoMindMoe2DeltaAttention(config, layer_idx)
         )
 
-        self.mlp = NekoMindMoeSparseMoeBlock(config) if config.mlp_layer_types[layer_idx] == "sparse" else NekoMindMoeMLP(config)
+        self.mlp = NekoMindMoe2SparseMoeBlock(config) if config.mlp_layer_types[layer_idx] == "sparse" else NekoMindMoe2MLP(config)
 
-        self.input_layernorm = NekoMindMoeRMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.post_attention_layernorm = NekoMindMoeRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.input_layernorm = NekoMindMoe2RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = NekoMindMoe2RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.block_type = config.layer_types[layer_idx]
 
     def forward(
@@ -385,19 +385,19 @@ class NekoMindMoeDecoderLayer(GradientCheckpointingLayer):
 
 
 @auto_docstring
-class NekoMindMoePreTrainedModel(PreTrainedModel):
-    config: NekoMindMoeConfig
+class NekoMindMoe2PreTrainedModel(PreTrainedModel):
+    config: NekoMindMoe2Config
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["NekoMindMoeDecoderLayer"]
+    _no_split_modules = ["NekoMindMoe2DecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
     _supports_flash_attn = True
     _supports_sdpa = True
     _keys_to_ignore_on_load_unexpected = None
     _can_record_outputs = {
-        "router_logits": OutputRecorder(NekoMindMoeTopKRouter, index=0),
-        "hidden_states": NekoMindMoeDecoderLayer,
-        "attentions": NekoMindMoeAttention,
+        "router_logits": OutputRecorder(NekoMindMoe2TopKRouter, index=0),
+        "hidden_states": NekoMindMoe2DecoderLayer,
+        "attentions": NekoMindMoe2Attention,
     }
     _is_stateful = True
     _can_compile_fullgraph = True
@@ -405,31 +405,31 @@ class NekoMindMoePreTrainedModel(PreTrainedModel):
     @torch.no_grad()
     def _init_weights(self, module):
         super()._init_weights(module)
-        if isinstance(module, NekoMindMoeForgetGate):  # following FLA initialization
+        if isinstance(module, NekoMindMoe2ForgetGate):  # following FLA initialization
             # A_log
             init.copy_(module.A_log, init.uniform_(module.A_log, a=1.0, b=16.0).log())
             # dt_bias
             init.uniform_(module.dt_bias, a=math.log(1e-3), b=math.log(1e-1))
             dt = module.dt_bias.exp().clamp_min(1e-4)
             init.copy_(module.dt_bias, dt + torch.log(-torch.expm1(-dt)))  # (stable) inverse softplus
-        elif isinstance(module, NekoMindMoeExperts):
+        elif isinstance(module, NekoMindMoe2Experts):
             init.normal_(module.gate_up_proj, mean=0.0, std=self.config.initializer_range)
             init.normal_(module.down_proj, mean=0.0, std=self.config.initializer_range)
-        elif isinstance(module, NekoMindMoeTopKRouter):
+        elif isinstance(module, NekoMindMoe2TopKRouter):
             init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
-        elif isinstance(module, NekoMindMoeRMSNormGated):
+        elif isinstance(module, NekoMindMoe2RMSNormGated):
             init.ones_(module.weight)
 
 
 @auto_docstring
-class NekoMindMoeModel(NekoMindMoePreTrainedModel):
-    def __init__(self, config: NekoMindMoeConfig):
+class NekoMindMoe2Model(NekoMindMoe2PreTrainedModel):
+    def __init__(self, config: NekoMindMoe2Config):
         super().__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
         self.layers = nn.ModuleList(
-            [NekoMindMoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [NekoMindMoe2DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = NekoMindMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = NekoMindMoe2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         self.post_init()
@@ -497,7 +497,7 @@ class NekoMindMoeModel(NekoMindMoePreTrainedModel):
 
 
 @auto_docstring
-class NekoMindMoeForCausalLM(NekoMindMoePreTrainedModel, GenerationMixin):
+class NekoMindMoe2ForCausalLM(NekoMindMoe2PreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_gather_output"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
@@ -505,7 +505,7 @@ class NekoMindMoeForCausalLM(NekoMindMoePreTrainedModel, GenerationMixin):
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = NekoMindMoeModel(config)
+        self.model = NekoMindMoe2Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.router_aux_loss_coef = config.router_aux_loss_coef
@@ -539,9 +539,9 @@ class NekoMindMoeForCausalLM(NekoMindMoePreTrainedModel, GenerationMixin):
         Example:
 
         ```python
-        >>> from transformers import AutoTokenizer, NekoMindMoeForCausalLM
+        >>> from transformers import AutoTokenizer, NekoMindMoe2ForCausalLM
 
-        >>> model = NekoMindMoeForCausalLM.from_pretrained("nekocyrene/NekoMind1.5-Base")
+        >>> model = NekoMindMoe2ForCausalLM.from_pretrained("nekocyrene/NekoMind1.5-Base")
         >>> tokenizer = AutoTokenizer.from_pretrained("nekocyrene/NekoMind1.5-Base")
 
         >>> prompt = "Hey, are you conscious? Can you talk to me?"
@@ -601,8 +601,8 @@ class NekoMindMoeForCausalLM(NekoMindMoePreTrainedModel, GenerationMixin):
 
 
 __all__ = [
-    "NekoMindMoeConfig",
-    "NekoMindMoeForCausalLM",
-    "NekoMindMoeModel",
-    "NekoMindMoePreTrainedModel",
+    "NekoMindMoe2Config",
+    "NekoMindMoe2ForCausalLM",
+    "NekoMindMoe2Model",
+    "NekoMindMoe2PreTrainedModel",
 ]
