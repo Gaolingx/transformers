@@ -52,24 +52,18 @@ logger = logging.get_logger(__name__)
 @strict
 class NekoMindMoeConfig(PreTrainedConfig):
     r"""
-    decoder_sparse_step (`int`, *optional*, defaults to 1):
-        The frequency of the MoE layer.
-    q_lora_rank (`int`, *optional*):
-        Query compression rank. When unset, use a direct query projection.
-    kv_lora_rank (`int`, *optional*):
-        MLA KV compression rank; must be supplied for MLA layers.
-    qk_nope_head_dim (`int`, *optional*):
-        Per-head Q/K dimension; must be supplied for MLA layers.
-    qk_rope_head_dim (`int`, *optional*):
-        Additional Q/shared-K dimension, without rotary encoding. Must be supplied (may be 0).
-    v_head_dim (`int`, *optional*):
-        Per-head value dimension; must be supplied for MLA layers.
     mla_use_nope (`bool`, *optional*, defaults to `True`):
         Use NoPE attention. MLA asserts that this is enabled.
     mla_use_output_gate (`bool`, *optional*, defaults to `False`):
         Apply sigmoid output gate before the MLA output projection.
     mlp_layer_types (`list[str]`, *optional*):
         List of layer types for the MLP or MoE layers. Defaults to None.
+    linear_head_dim (`int`, *optional*):
+        Dimension of each head in linear attention layers. Defaults to 128.
+    linear_num_heads (`int`, *optional*):
+        Number of heads for the linear attention layers. Defaults to 32.
+    linear_conv_kernel_dim (`int`, *optional*, defaults to 4):
+        Kernel size for the short convolution applied to queries, keys, and values in linear attention layers.
 
     ```python
     >>> from transformers import NekoMindMoeModel, NekoMindMoeConfig
@@ -194,6 +188,10 @@ class NekoMindMoeAttention(DeepseekV3Attention):
         super().__init__(config, layer_idx)
         self.scaling = self.qk_head_dim ** (-0.5)
 
+        self.use_output_gate = config.mla_use_output_gate
+        if self.use_output_gate:
+            self.g_proj = nn.Linear(self.hidden_size, self.num_heads * self.v_head_dim, bias=False)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -239,6 +237,9 @@ class NekoMindMoeAttention(DeepseekV3Attention):
         )
 
         attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
+        # Divergence from Deepseek V2 MLA: there is an additional gate to control the output of the attention
+        if self.use_output_gate:
+            attn_output = attn_output * self.g_proj(hidden_states).sigmoid()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 

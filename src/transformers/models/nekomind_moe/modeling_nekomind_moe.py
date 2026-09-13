@@ -142,6 +142,10 @@ class NekoMindMoeAttention(nn.Module):
         )
         self.scaling = self.qk_head_dim ** (-0.5)
 
+        self.use_output_gate = config.mla_use_output_gate
+        if self.use_output_gate:
+            self.g_proj = nn.Linear(self.hidden_size, self.num_heads * self.v_head_dim, bias=False)
+
     def expand_kv(self, kv_nope: torch.Tensor, k_rot: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Expands the compressed latents into key and value states. Args:
             - kv_nope: key + value without positional encoding, shape [batch_size, 1, seqlen, self.kv_lora_rank]
@@ -206,6 +210,9 @@ class NekoMindMoeAttention(nn.Module):
         )
 
         attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
+        # Divergence from Deepseek V2 MLA: there is an additional gate to control the output of the attention
+        if self.use_output_gate:
+            attn_output = attn_output * self.g_proj(hidden_states).sigmoid()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
