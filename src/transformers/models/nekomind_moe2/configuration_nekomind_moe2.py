@@ -41,19 +41,6 @@ class NekoMindMoe2Config(PreTrainedConfig):
         Kernel size for the short convolution applied to queries, keys, and values in linear attention layers.
     linear_lower_bound (`float`, *optional*, defaults to -5.0):
         Whether the forget gate has a lower bound to apply to the decay.
-
-    ```python
-    >>> from transformers import NekoMindMoe2Model, NekoMindMoe2Config
-
-    >>> # Initializing a NekoMind2 style configuration
-    >>> configuration = NekoMindMoe2Config()
-
-    >>> # Initializing a model from the NekoMind1.5-Base style configuration
-    >>> model = NekoMindMoe2Model(configuration)
-
-    >>> # Accessing the model configuration
-    >>> configuration = model.config
-    ```
     """
 
     model_type = "nekomind_moe2"
