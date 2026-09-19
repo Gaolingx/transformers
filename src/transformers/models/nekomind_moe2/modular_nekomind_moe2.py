@@ -29,14 +29,18 @@ from ...generation import GenerationMixin
 from ...masking_utils import create_causal_mask, create_recurrent_attention_mask
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
 from ...modeling_layers import GradientCheckpointingLayer
-from ...modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
+from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, MoeModelOutputWithPast
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
 from ...utils.generic import merge_with_config_defaults
 from ...utils.output_capturing import OutputRecorder, capture_outputs
-from ..deepseek_v3.modeling_deepseek_v3 import DeepseekV3Attention
-from ..gemma.modeling_gemma import GemmaMLP
+from ...models.deepseek_v3.modeling_deepseek_v3 import (
+    DeepseekV3Attention,
+    DeepseekV3Experts,
+    DeepseekV3MLP,
+    DeepseekV3TopkRouter,
+)
 from ..glm5_next.modeling_glm5_next import (
     Glm5NextTextForgetGate,
     Glm5NextTextLinearAttention,
@@ -53,8 +57,6 @@ logger = logging.get_logger(__name__)
 @strict
 class NekoMindMoe2Config(PreTrainedConfig):
     r"""
-    mla_use_nope (`bool`, *optional*, defaults to `True`):
-        Use NoPE attention. MLA asserts that this is enabled.
     mla_use_output_gate (`bool`, *optional*, defaults to `False`):
         Apply sigmoid output gate before the MLA output projection.
     mlp_layer_types (`list[str]`, *optional*):
@@ -71,13 +73,6 @@ class NekoMindMoe2Config(PreTrainedConfig):
 
     model_type = "nekomind_moe2"
     keys_to_ignore_at_inference = ["past_key_values"]
-
-    attribute_map = {
-        "num_experts": "num_local_experts",
-        "num_experts_per_tok": "num_experts_per_token",
-    }
-
-    # Default tensor parallel plan for base model `NekoMindMoe`
     base_model_tp_plan = {
         "layers.*.mlp.experts.gate_up_proj": "packed_colwise",
         "layers.*.mlp.experts.down_proj": "rowwise",
@@ -101,40 +96,46 @@ class NekoMindMoe2Config(PreTrainedConfig):
         "layers.*.mlp.experts": "moe_tp_experts",
     }
 
+    attribute_map = {
+        "num_local_experts": "n_routed_experts",
+        "num_experts_per_tok": "num_experts_per_token",
+    }
+
     vocab_size: int = 151936
     hidden_size: int = 2048
     intermediate_size: int = 6144
+    moe_intermediate_size: int = 768
     num_hidden_layers: int = 24
     num_attention_heads: int = 32
     num_key_value_heads: int | None = 32
+    n_shared_experts: int = 1
+    routed_scaling_factor: float = 2.446
+    kv_lora_rank: int = 512
     q_lora_rank: int | None = None
-    kv_lora_rank: int | None = None
-    qk_nope_head_dim: int = 128
     qk_rope_head_dim: int = 64
     v_head_dim: int | None = 128
-    mla_use_nope: bool = True
-    mla_use_output_gate: bool = False
-    linear_lower_bound: float | None = -5.0
+    qk_nope_head_dim: int = 128
+    n_group: int | None = 8
+    topk_group: int | None = 4
+    num_experts_per_tok: int = 8
+    norm_topk_prob: bool = True
     hidden_act: str = "silu"
     max_position_embeddings: int = 32768
     initializer_range: float = 0.02
     rms_norm_eps: float = 1e-6
     use_cache: bool = True
-    tie_word_embeddings: bool = False
-    attention_dropout: float | int = 0.0
-    attention_bias: bool = False
-    moe_intermediate_size: int = 768
-    shared_expert_intermediate_size: int = 768
-    num_experts_per_tok: int = 8
-    num_experts: int = 128
-    norm_topk_prob: bool = False
-    output_router_logits: bool = False
-    router_aux_loss_coef: float = 0.001
-    mlp_layer_types: list[str] | None = None
-    layer_types: list[str] | None = None
     pad_token_id: int | None = None
     bos_token_id: int | None = None
     eos_token_id: int | list[int] | None = None
+    pretraining_tp: int | None = 1
+    tie_word_embeddings: bool = False
+    attention_bias: bool = False
+    attention_dropout: float | int | None = 0.0
+    num_local_experts: int = 128
+    mla_use_output_gate: bool = False
+    linear_lower_bound: float | None = -5.0
+    mlp_layer_types: list[str] | None = None
+    layer_types: list[str] | None = None
 
     linear_head_dim: int = 128
     linear_num_heads: int = 32
@@ -143,9 +144,9 @@ class NekoMindMoe2Config(PreTrainedConfig):
     def __post_init__(self, **kwargs):
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
+
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.head_dim = self.qk_rope_head_dim
-
         super().__post_init__(**kwargs)
         # Checkpoint stores linear attention attributes in a config sub-dict: if it's there, extract them
         linear_attn_config = kwargs.get("linear_attn_config", {})
@@ -255,65 +256,40 @@ class NekoMindMoe2DeltaAttention(Glm5NextTextLinearAttention):
         self.o_norm = NekoMindMoe2RMSNormGated(self.head_dim, eps=self.layer_norm_epsilon)
 
 
-class NekoMindMoe2MLP(GemmaMLP):
-    def __init__(self, config, intermediate_size=None):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
+class NekoMindMoe2Experts(DeepseekV3Experts):
+    pass
 
 
-class NekoMindMoe2Experts(MixtralExperts):
-    def __init__(self, config):
-        super().__init__(config)
-        self.num_experts = config.num_experts
-        self.intermediate_dim = config.moe_intermediate_size
+class NekoMindMoe2MLP(DeepseekV3MLP):
+    pass
 
 
-class NekoMindMoe2TopKRouter(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.top_k = config.num_experts_per_tok
-        self.num_experts = config.num_experts
-        self.norm_topk_prob = config.norm_topk_prob
-        self.hidden_dim = config.hidden_size
-        self.weight = nn.Parameter(torch.zeros(self.num_experts, self.hidden_dim))
-
-    def forward(self, hidden_states):
-        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        router_logits = F.linear(hidden_states, self.weight)  # (seq_len, num_experts)
-        routing_weights = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
-        router_top_value, router_indices = torch.topk(routing_weights, self.top_k, dim=-1)  # (seq_len, top_k)
-        if self.norm_topk_prob:
-            router_top_value /= router_top_value.sum(dim=-1, keepdim=True)
-        router_scores = router_top_value.to(routing_weights.dtype)
-        return router_logits, router_scores, router_indices
+class NekoMindMoe2TopKRouter(DeepseekV3TopkRouter):
+    pass
 
 
-class NekoMindMoe2SparseMoeBlock(nn.Module):
+class NekoMindMoe2MoE(nn.Module):
+    """
+    A mixed expert module containing shared experts.
+    """
+
     def __init__(self, config: NekoMindMoe2Config):
         super().__init__()
+        self.config = config
         self.experts = NekoMindMoe2Experts(config)
         self.gate = NekoMindMoe2TopKRouter(config)
-        self.shared_expert = NekoMindMoe2MLP(config, intermediate_size=config.shared_expert_intermediate_size)
-        self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+        self.shared_experts = NekoMindMoe2MLP(
+            config=config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
+        )
 
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size, sequence_length, hidden_dim = hidden_states.shape
-        hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
-        shared_expert_output = self.shared_expert(hidden_states_reshaped)
-        _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
-        expert_output = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
-
-        shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output
-
-        expert_output = expert_output + shared_expert_output
-        expert_output = expert_output.reshape(batch_size, sequence_length, hidden_dim)
-        return expert_output
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        residuals = hidden_states
+        orig_shape = hidden_states.shape
+        _, topk_weights, topk_indices = self.gate(hidden_states)
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        hidden_states = self.experts(hidden_states, topk_indices, topk_weights).view(*orig_shape)
+        hidden_states = hidden_states + self.shared_experts(residuals)
+        return hidden_states
 
 
 class NekoMindMoe2RMSNorm(LlamaRMSNorm):
@@ -335,7 +311,7 @@ class NekoMindMoe2DecoderLayer(GradientCheckpointingLayer):
             else NekoMindMoe2DeltaAttention(config, layer_idx)
         )
 
-        self.mlp = NekoMindMoe2SparseMoeBlock(config) if config.mlp_layer_types[layer_idx] == "sparse" else NekoMindMoe2MLP(config)
+        self.mlp = NekoMindMoe2MoE(config) if config.mlp_layer_types[layer_idx] == "sparse" else NekoMindMoe2MLP(config)
 
         self.input_layernorm = NekoMindMoe2RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = NekoMindMoe2RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -503,9 +479,6 @@ class NekoMindMoe2ForCausalLM(NekoMindMoe2PreTrainedModel, GenerationMixin):
         self.model = NekoMindMoe2Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.router_aux_loss_coef = config.router_aux_loss_coef
-        self.num_experts = config.num_experts
-        self.num_experts_per_tok = config.num_experts_per_tok
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -521,10 +494,9 @@ class NekoMindMoe2ForCausalLM(NekoMindMoe2PreTrainedModel, GenerationMixin):
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
-        output_router_logits: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> MoeModelOutputWithPast:
+    ) -> CausalLMOutputWithPast:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
@@ -547,20 +519,13 @@ class NekoMindMoe2ForCausalLM(NekoMindMoe2PreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
-
-        output_router_logits = (
-            output_router_logits if output_router_logits is not None else self.config.output_router_logits
-        )
-
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs: MoeModelOutputWithPast = self.model(
+        outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
-            output_router_logits=output_router_logits,
             **kwargs,
         )
 
@@ -571,27 +536,14 @@ class NekoMindMoe2ForCausalLM(NekoMindMoe2PreTrainedModel, GenerationMixin):
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
-        aux_loss = None
-        if output_router_logits:
-            aux_loss = load_balancing_loss_func(
-                outputs.router_logits,
-                self.num_experts,
-                self.num_experts_per_tok,
-                attention_mask,
-            )
-            if labels is not None:
-                loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
-
-        return MoeCausalLMOutputWithPast(
+        return CausalLMOutputWithPast(
             loss=loss,
-            aux_loss=aux_loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            router_logits=outputs.router_logits,
         )
 
 
