@@ -388,6 +388,7 @@ class NekoMindMoe2PreTrainedModel(PreTrainedModel):
             init.normal_(module.down_proj, mean=0.0, std=self.config.initializer_range)
         elif isinstance(module, NekoMindMoe2TopKRouter):
             init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+            init.zeros_(module.e_score_correction_bias)
         elif isinstance(module, NekoMindMoe2RMSNormGated):
             init.ones_(module.weight)
 
