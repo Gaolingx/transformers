@@ -57,6 +57,8 @@ logger = logging.get_logger(__name__)
 @strict
 class NekoMindMoe2Config(PreTrainedConfig):
     r"""
+    n_group (`int`, *optional*, defaults to 8):
+        Number of groups for routed experts.
     mla_use_output_gate (`bool`, *optional*, defaults to `False`):
         Apply sigmoid output gate before the MLA output projection.
     mlp_layer_types (`list[str]`, *optional*):
